@@ -1,0 +1,8 @@
+# Raw benchmark data can get large; keep folder structure via .gitkeep but ignore run output.
+results/**/*.csv
+results/**/*.summary.txt
+results/**/meta.json
+results/**/20*/
+
+# Claude Code's own session-local files - not part of the project.
+.claude/

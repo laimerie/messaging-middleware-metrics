@@ -1,0 +1,35 @@
+# NATS Core (no JetStream) — single node, for local performance benchmarking.
+#
+# The `-js` flag is deliberately OMITTED: this project benchmarks NATS Core
+# only (in-memory pub/sub, no persistence, no streams). If JetStream
+# benchmarking is needed later, add it as a separate service/profile rather
+# than flipping this one — keep "what NATS Core scenario is testing" stable.
+#
+# Cluster port 6222 is intentionally not published — single-node scope only.
+services:
+  nats:
+    image: nats:2.11-alpine
+    container_name: nats-core-bench
+    ports:
+      - "4222:4222"   # client connections — what `nats bench` connects to
+      - "8222:8222"   # HTTP monitoring (/varz, /connz, /subsz) — used for health checks
+    command: ["-m", "8222"]
+    restart: unless-stopped
+
+  # One-way (publisher -> subscriber) latency benchmark tool (TODO.md #4), and general
+  # "host client" image for the cross-host container tests (TODO.md #3) — bundles both
+  # our own latency_oneway binary and the nats CLI. C++ / CentOS 7 / gcc 11, matching the
+  # production runtime — see docker/latency-tool/Dockerfile.
+  # `profiles: [tools]` keeps this out of `docker compose up`; invoke explicitly, e.g.:
+  #   docker compose run --rm -v <results-dir>:/out latency-tool latency_oneway --subject ... --out /out
+  # cap_add NET_ADMIN: required for entrypoint.sh's `tc netem` delay injection
+  # (bench-crosshost.ps1's -NetemDelayMs). Harmless/unused when that's not set.
+  latency-tool:
+    build:
+      context: .
+      dockerfile: docker/latency-tool/Dockerfile
+    profiles: ["tools"]
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - nats

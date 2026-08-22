@@ -1,0 +1,4 @@
+# This project's scripts run on a real Linux host (see CLAUDE.md). Force LF line endings
+# regardless of a contributor's local core.autocrlf setting - CRLF-terminated shell
+# scripts fail on Linux with "bad interpreter: /bin/bash^M: no such file or directory".
+* text=auto eol=lf

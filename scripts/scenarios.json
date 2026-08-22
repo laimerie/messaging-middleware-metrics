@@ -1,0 +1,40 @@
+{
+  "scenarios": [
+    {
+      "category": "throughput",
+      "script": "bench-throughput.sh",
+      "label": "baseline",
+      "params": { "msgs": 100000, "size": 128 }
+    },
+    {
+      "category": "throughput",
+      "script": "bench-throughput.sh",
+      "label": "large-message",
+      "params": { "msgs": 50000, "size": 16384 }
+    },
+    {
+      "category": "throughput",
+      "script": "bench-throughput.sh",
+      "label": "multi-client",
+      "params": { "msgs": 100000, "pub-clients": 4, "sub-clients": 4 }
+    },
+    {
+      "category": "latency",
+      "script": "bench-latency.sh",
+      "label": "rtt-quick-check",
+      "params": { "msgs": 5000 }
+    },
+    {
+      "category": "latency",
+      "script": "bench-latency-oneway.sh",
+      "label": "steady-1000",
+      "params": { "target-msgs-per-sec": 1000, "duration-sec": 20 }
+    },
+    {
+      "category": "scalability",
+      "script": "bench-scalability.sh",
+      "label": "default-sweep",
+      "params": { "connection-counts": "1,5,10,25", "msgs-per-client": 5000 }
+    }
+  ]
+}
