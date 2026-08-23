@@ -5,5 +5,4 @@
 # docker/latency-tool/Dockerfile (both COPY'd via explicit paths, unaffected by this file).
 results/
 scripts/
-.claude/
 *.md
