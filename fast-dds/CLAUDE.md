@@ -100,6 +100,28 @@ That is what makes them worth writing down.
   separately, times the ack wait outside the send loop, reporting it as
   `metrics.pub.ack_wait_sec`. Pass `--heartbeat-period-ms 3000` to measure the
   out-of-the-box behaviour.
+- **Sleeping cannot pace a high send rate, and getting this wrong silently changes what the
+  run measured.** `sleep_for(100us)` overshot by 83us at the median here (300us at p99), so
+  a requested 10000/s delivered only ~5500/s — the run reported one rate and measured
+  another, and the uneven wake-ups made sending bursty, inflating the receiver's queueing
+  tail. `--pacing auto` (the default) sleeps to within `kPacingSpinGuard` (200us) of the
+  target and busy-spins the rest: measured 9437/s achieved, with p50 74→62us and p99
+  407→298us as a side effect. `--pacing sleep` restores the old behaviour for low-rate or
+  CPU-constrained runs. `publishAll` warns whenever the achieved rate falls below 90% of
+  the requested one — do not remove that; it is the guard against this recurring silently.
+- **`std::thread::hardware_concurrency()` is useless inside a container.** libstdc++
+  implements it with `sysconf(_SC_NPROCESSORS_ONLN)`, which reports the HOST's online CPUs
+  and ignores container limits — confirmed: under `docker run --cpuset-cpus=0,1` it still
+  returned 12. Since this tool only ever runs in a container, a check built on it is dead
+  code in exactly the case it exists for. `availableCores()` uses `sched_getaffinity`
+  (honours `--cpuset-cpus`/taskset) and the cgroup CPU quota (`cpu.max` on v2,
+  `cpu.cfs_quota_us` on v1, honouring `--cpus`), taking the smaller. Verified to fire under
+  both limit mechanisms and stay silent unrestricted.
+- **A busy-spinning publisher must not outnumber the cores.** It occupies one core per
+  publisher thread; if the Fast DDS reception threads cannot also get a core, the spin
+  starves the very receive path being measured (confirmed: restricted to 2 cores, p99 went
+  575us → 637us). `warnIfPacingWillStarveReceiver` warns rather than refusing — a caller
+  with pinned/isolated cores may legitimately know better.
 - **Git Bash on Windows mangles `--out /out`** into something like
   `C:/Program Files/Git/out` via its MSYS path conversion, because it cannot know the path
   is container-internal. The tool then writes nowhere, silently (C++ `ofstream` does not

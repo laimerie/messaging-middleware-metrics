@@ -58,6 +58,14 @@ TRANSPORT="udp"
 DISCOVERY="simple"
 DOMAIN=0
 INTRAPROCESS="off"
+# How the publisher waits out each send interval. "auto" sleeps for the bulk of a long
+# interval and busy-spins the last 200us, so a requested rate is actually achieved: under
+# the previous sleep-only approach a requested 10000/s delivered ~5500/s, meaning runs
+# silently measured a rate other than the one they reported. "sleep" restores the old
+# behaviour (no CPU cost, inaccurate at high rates); "busy" always spins.
+# A spinning publisher occupies one core per publisher thread - dds_bench warns if the
+# machine does not have enough cores for that plus the reception threads.
+PACING="auto"
 
 COMMON_ARG_CONSUMED=0
 
@@ -81,6 +89,7 @@ parse_common_arg() {
         --discovery)     DISCOVERY="$2";     COMMON_ARG_CONSUMED=2 ;;
         --domain)        DOMAIN="$2";        COMMON_ARG_CONSUMED=2 ;;
         --intraprocess)  INTRAPROCESS="$2";  COMMON_ARG_CONSUMED=2 ;;
+        --pacing)        PACING="$2";        COMMON_ARG_CONSUMED=2 ;;
     esac
     [ "$COMMON_ARG_CONSUMED" -gt 0 ]
 }
@@ -90,7 +99,7 @@ dds_common_args() {
     printf '%s\n' --reliability "$RELIABILITY" --durability "$DURABILITY" \
         --history "$HISTORY" --history-depth "$HISTORY_DEPTH" \
         --transport "$TRANSPORT" --discovery "$DISCOVERY" --domain "$DOMAIN" \
-        --intraprocess "$INTRAPROCESS"
+        --intraprocess "$INTRAPROCESS" --pacing "$PACING"
     if [ "$DISCOVERY" = "server" ]; then
         printf '%s\n' --discovery-server-address "$DS_ADDRESS" \
             --discovery-server-port "$DS_PORT"
@@ -105,9 +114,10 @@ common_params_json() {
         --arg history "$HISTORY" --argjson historyDepth "$HISTORY_DEPTH" \
         --arg transport "$TRANSPORT" --arg discovery "$DISCOVERY" \
         --argjson domain "$DOMAIN" --arg intraprocess "$INTRAPROCESS" \
+        --arg pacing "$PACING" \
         '{reliability:$reliability, durability:$durability, history:$history,
           historyDepth:$historyDepth, transport:$transport, discovery:$discovery,
-          domain:$domain, intraprocess:$intraprocess}'
+          domain:$domain, intraprocess:$intraprocess, pacing:$pacing}'
 }
 
 new_run_dir() {

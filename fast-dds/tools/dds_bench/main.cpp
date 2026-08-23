@@ -79,6 +79,8 @@
 #include <fastrtps/utils/IPLocator.h>
 #include <fastrtps/xmlparser/XMLProfileManager.h>
 
+#include <sched.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -118,6 +120,14 @@ constexpr uint32_t kHeaderSize = 16;
 // which it only does in ASYNCHRONOUS publish mode. parseArgs auto-switches so a large
 // --size doesn't silently deliver nothing.
 constexpr int kFragmentationThreshold = 60000;
+
+// How much of each pacing interval `--pacing auto` hands to a busy spin instead of the OS.
+// Sized from measurement, not taste: on this project's Docker Desktop/WSL2 environment a
+// std::this_thread::sleep_for(100us) overshot by 83us at the median and 300us at p99, so
+// anything under a couple of hundred microseconds cannot be delivered by sleeping at all.
+// Sleeping up to (target - this) and spinning the remainder keeps the wake-up error inside
+// the spin window while still yielding the CPU for the bulk of a long interval.
+constexpr auto kPacingSpinGuard = std::chrono::microseconds(200);
 
 int64_t nowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
@@ -163,6 +173,19 @@ struct Options {
     // own performance tests shorten it for the same reason. Set --heartbeat-period-ms 3000
     // to measure the out-of-the-box behaviour instead.
     int heartbeatPeriodMs = 100;
+
+    // RELIABLE retransmission path timings. Both keep Fast DDS's own defaults (5ms each),
+    // because changing them silently would misrepresent out-of-the-box behaviour — but
+    // note what those defaults imply: a sample that has to be retransmitted costs at least
+    // heartbeatResponseDelay (reader waits before ACKNACK) + nackResponseDelay (writer
+    // waits before resending) ≈ 10ms. Any latency budget under 10ms is therefore only
+    // meetable if retransmission NEVER happens, unless these are lowered. Exposed so a
+    // sub-millisecond target can actually be tested. (Two more, startup-only, are left
+    // hardcoded at Fast DDS defaults: writer initialHeartbeatDelay 12ms and reader
+    // initialAcknackDelay 70ms — they affect the first exchange after matching, not the
+    // steady state.)
+    int nackResponseDelayUs = 5000;       // writer: delay before answering an ACKNACK
+    int heartbeatResponseDelayUs = 5000;  // reader: delay before answering a HEARTBEAT
     std::string publishMode = "auto";  // sync | async | auto (async once size >= 60000)
 
     std::string transport = "udp";     // udp | shm
@@ -173,6 +196,24 @@ struct Options {
 
     std::string intraprocess = "off";  // off | on
     std::string out = ".";
+
+    // How the publisher waits out each send interval.
+    //   sleep : hand the whole wait to the OS. Costs no CPU, but the OS timer is far
+    //           coarser than a high send rate needs — measured here, a requested 10000/s
+    //           actually achieved ~4900/s, so the run silently measured a different
+    //           condition than it reported, and the uneven wake-ups made the sending
+    //           bursty, inflating the receiver's queueing tail.
+    //   busy  : spin on the clock. Nanosecond-accurate, but occupies a full CPU core per
+    //           publisher thread for the whole run.
+    //   auto  : sleep down to kPacingSpinGuard before the target, then spin. Accurate at
+    //           any rate, and only pays the full core cost when the interval is too short
+    //           to sleep through at all (roughly above 5000 msgs/sec).
+    std::string pacing = "auto";  // auto | sleep | busy
+
+    // Simulated per-sample application work on the subscriber side. 0 = consume as fast as
+    // possible. Exists to quantify how much application-side processing a given send rate
+    // tolerates before BEST_EFFORT starts dropping.
+    int subWorkUs = 0;
 
     int matchTimeoutSec = 30;
     int idleTimeoutSec = 5;  // subscriber gives up this long after the LAST message
@@ -298,9 +339,17 @@ private:
 
 class ReaderListener : public DataReaderListener {
 public:
-    ReaderListener(uint32_t payloadSize, bool keepSamples, MatchCounter* matches)
-        : keepSamples_(keepSamples), matches_(matches) {
+    ReaderListener(uint32_t payloadSize, bool keepSamples, MatchCounter* matches,
+                   uint64_t expectedSamples, int workUs)
+        : keepSamples_(keepSamples), matches_(matches), workUs_(workUs) {
         scratch_.bytes.resize(payloadSize);
+        // Reserve up front. Fast DDS calls on_data_available on its RECEPTION thread, so
+        // anything slow in here stops the transport being drained — and a vector growing
+        // to 100k entries reallocates ~17 times, each copying the whole buffer, right on
+        // that thread. Cheap to avoid, so avoid it.
+        if (keepSamples && expectedSamples > 0) {
+            samples_.reserve(static_cast<size_t>(expectedSamples));
+        }
     }
 
     void on_subscription_matched(DataReader*, const SubscriptionMatchedStatus& info) override {
@@ -333,6 +382,17 @@ public:
             ++buckets_[bucket];
 
             if (onSample_) onSample_(scratch_);
+
+            // Simulated application work per sample (--sub-work-us). Busy-spins rather
+            // than sleeping, so it models a subscriber that is CPU-busy rather than one
+            // that has yielded the core. Because this callback runs on the reception
+            // thread, this is exactly the knob that answers "how fast must my application
+            // consume to avoid loss?" — see README.md.
+            if (workUs_ > 0) {
+                const auto until = Clock::now() + std::chrono::microseconds(workUs_);
+                while (Clock::now() < until) {
+                }
+            }
         }
     }
 
@@ -350,6 +410,7 @@ private:
     BenchSample scratch_;
     bool keepSamples_;
     MatchCounter* matches_;
+    int workUs_ = 0;
     uint64_t count_ = 0;
     uint64_t bytes_ = 0;
     int64_t firstNs_ = 0;
@@ -461,6 +522,13 @@ void applyReliability(const Options& opt, ReliabilityQosPolicy& reliability,
     }
 }
 
+// WriterTimes/ReaderTimes field type: Duration_t lives in eprosima::fastrtps, NOT in
+// eprosima::fastrtps::rtps, even though the structs holding it are in the rtps namespace.
+void setDuration(eprosima::fastrtps::Duration_t& d, int microseconds) {
+    d.seconds = microseconds / 1000000;
+    d.nanosec = static_cast<uint32_t>(microseconds % 1000000) * 1000u;
+}
+
 std::string topicName(const Options& opt, uint32_t index) {
     if (opt.topicCount <= 1) return opt.topic;
     return opt.topic + "_" + std::to_string(index);
@@ -508,9 +576,8 @@ void createWriters(Endpoints& ep, const Options& opt, const std::vector<Topic*>&
     wqos.resource_limits().max_instances = 1;
     wqos.resource_limits().max_samples_per_instance = 0;
     // See Options::heartbeatPeriodMs for why the 3-second default is not usable here.
-    wqos.reliable_writer_qos().times.heartbeatPeriod.seconds = opt.heartbeatPeriodMs / 1000;
-    wqos.reliable_writer_qos().times.heartbeatPeriod.nanosec =
-        static_cast<uint32_t>(opt.heartbeatPeriodMs % 1000) * 1000000u;
+    setDuration(wqos.reliable_writer_qos().times.heartbeatPeriod, opt.heartbeatPeriodMs * 1000);
+    setDuration(wqos.reliable_writer_qos().times.nackResponseDelay, opt.nackResponseDelayUs);
 
     for (Topic* topic : topics) {
         ep.writerListeners.push_back(std::make_unique<WriterListener>(matches));
@@ -523,6 +590,8 @@ void createWriters(Endpoints& ep, const Options& opt, const std::vector<Topic*>&
 
 void createReaders(Endpoints& ep, const Options& opt, const std::vector<Topic*>& topics,
                    bool keepSamples, MatchCounter* matches) {
+    // Per reader, so divide the run's total by however many topics this participant reads.
+    const uint64_t expectedPerReader = topics.empty() ? 0 : opt.msgs / topics.size() + 1;
     if (ep.subscriber == nullptr) {
         ep.subscriber = ep.participant->create_subscriber(SUBSCRIBER_QOS_DEFAULT);
         if (ep.subscriber == nullptr) fail("failed to create Subscriber");
@@ -533,10 +602,13 @@ void createReaders(Endpoints& ep, const Options& opt, const std::vector<Topic*>&
     rqos.resource_limits().max_samples = 0;
     rqos.resource_limits().max_instances = 1;
     rqos.resource_limits().max_samples_per_instance = 0;
+    setDuration(rqos.reliable_reader_qos().times.heartbeatResponseDelay,
+                opt.heartbeatResponseDelayUs);
 
     for (Topic* topic : topics) {
         ep.readerListeners.push_back(std::make_unique<ReaderListener>(
-            static_cast<uint32_t>(opt.size), keepSamples, matches));
+            static_cast<uint32_t>(opt.size), keepSamples, matches, expectedPerReader,
+            opt.subWorkUs));
         DataReader* reader =
             ep.subscriber->create_datareader(topic, rqos, ep.readerListeners.back().get());
         if (reader == nullptr) fail("failed to create DataReader on '" + topic->get_name() + "'");
@@ -555,6 +627,82 @@ void destroyEndpoints(Endpoints& ep) {
 // Publishing
 // ---------------------------------------------------------------------------------------
 
+// Waits until `target` according to the selected pacing strategy. See Options::pacing.
+void pacedWaitUntil(Clock::time_point target, const std::string& pacing) {
+    if (pacing == "sleep") {
+        std::this_thread::sleep_until(target);
+        return;
+    }
+    if (pacing != "busy") {  // "auto": give the OS everything except the guard window
+        const auto spinFrom = target - kPacingSpinGuard;
+        if (Clock::now() < spinFrom) std::this_thread::sleep_until(spinFrom);
+    }
+    while (Clock::now() < target) {
+        // Deliberate busy spin — see Options::pacing for why sleeping cannot hit these
+        // intervals and what it costs when it tries.
+    }
+}
+
+// How many cores this PROCESS may actually use.
+//
+// Deliberately not std::thread::hardware_concurrency(): libstdc++ implements it with
+// sysconf(_SC_NPROCESSORS_ONLN), which reports the host's online CPUs and ignores both
+// container CPU limits. Confirmed here — under `docker run --cpuset-cpus=0,1` it still
+// reported 12. Since this tool only ever runs inside a container, that made the warning
+// below useless in exactly the situation it exists for.
+//
+//   sched_getaffinity : honours --cpuset-cpus (and taskset)
+//   cgroup cpu quota  : honours --cpus / compose `cpus:` (v2 cpu.max, v1 cfs_quota_us)
+//
+// Returns the smaller of the two, or 0 when nothing can be determined.
+unsigned availableCores() {
+    unsigned fromAffinity = 0;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        fromAffinity = static_cast<unsigned>(CPU_COUNT(&set));
+    }
+
+    unsigned fromQuota = 0;
+    // cgroup v2: "<quota> <period>", or "max <period>" when unlimited.
+    if (std::ifstream v2("/sys/fs/cgroup/cpu.max"); v2) {
+        std::string quota;
+        long period = 0;
+        if (v2 >> quota >> period && quota != "max" && period > 0) {
+            fromQuota = static_cast<unsigned>((std::stol(quota) + period - 1) / period);
+        }
+    } else if (std::ifstream q("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"); q) {
+        long quota = 0, period = 0;
+        std::ifstream p("/sys/fs/cgroup/cpu/cpu.cfs_period_us");
+        if (q >> quota && p && p >> period && quota > 0 && period > 0) {
+            fromQuota = static_cast<unsigned>((quota + period - 1) / period);
+        }
+    }
+
+    if (fromAffinity == 0) return fromQuota;
+    if (fromQuota == 0) return fromAffinity;
+    return std::min(fromAffinity, fromQuota);
+}
+
+// A spinning publisher occupies a whole core per thread. If the machine cannot also give
+// the Fast DDS reception threads a core, the spin starves the very receive path the run is
+// measuring and makes the result worse than reality — the opposite of the intent. Warn
+// rather than refuse: the caller may know better (dedicated cores, pinned threads).
+void warnIfPacingWillStarveReceiver(const Options& opt, uint64_t publisherThreads) {
+    if (opt.rate <= 0.0 || opt.pacing == "sleep") return;
+    const unsigned cores = availableCores();
+    if (cores == 0) return;  // unknown; nothing useful to say
+    const uint64_t needed = publisherThreads + 3;  // publishers + reception/app headroom
+    if (needed > cores) {
+        std::cerr << "WARNING: --pacing " << opt.pacing << " busy-spins one core per "
+                  << "publisher thread (" << publisherThreads << " here), but only " << cores
+                  << " core(s) are available to this process. The spin will compete with Fast DDS's reception "
+                     "threads and inflate the latency being measured. Use --pacing sleep, "
+                     "lower --pub-count, or run on a machine with at least "
+                  << needed << " cores." << std::endl;
+    }
+}
+
 struct PubResult {
     uint64_t sent = 0;
     double durationSec = 0.0;  // the send loop only - see ackWaitSec
@@ -569,6 +717,7 @@ struct PubResult {
 PubResult publishAll(const std::vector<Endpoints*>& groups, const Options& opt, uint64_t total) {
     std::atomic<uint64_t> nextSeq{0};
     const auto groupCount = static_cast<uint64_t>(groups.size());
+    warnIfPacingWillStarveReceiver(opt, groupCount);
     const auto start = Clock::now();
 
     std::vector<std::thread> threads;
@@ -595,8 +744,9 @@ PubResult publishAll(const std::vector<Endpoints*>& groups, const Options& opt, 
                 std::memcpy(sample.bytes.data() + sizeof(seq), &ts, sizeof(ts));
                 ep->writers[i % ep->writers.size()]->write(&sample);
                 if (paced) {
-                    std::this_thread::sleep_until(
-                        sendStart + std::chrono::duration_cast<Clock::duration>(interval));
+                    pacedWaitUntil(
+                        sendStart + std::chrono::duration_cast<Clock::duration>(interval),
+                        opt.pacing);
                 }
             }
         });
@@ -624,6 +774,23 @@ PubResult publishAll(const std::vector<Endpoints*>& groups, const Options& opt, 
     result.durationSec = std::chrono::duration<double>(sendEnd - start).count();
     result.ackWaitSec = std::chrono::duration<double>(Clock::now() - sendEnd).count();
     result.bytes = total * static_cast<uint64_t>(opt.size);
+
+    // A run that asked for one rate and delivered another has measured a condition it does
+    // not report. This went unnoticed once already (a requested 10000/s achieved ~4900/s
+    // under --pacing sleep), so say it out loud rather than leaving it to be spotted in
+    // result.json.
+    if (opt.rate > 0.0 && result.durationSec > 0.0) {
+        const double achieved = static_cast<double>(result.sent) / result.durationSec;
+        if (achieved < opt.rate * 0.9) {
+            std::cerr << "WARNING: requested --rate " << opt.rate << " msgs/sec but only achieved "
+                      << achieved << ". The measured latency belongs to the achieved rate, not "
+                      << "the requested one."
+                      << (opt.pacing == "sleep"
+                              ? " --pacing sleep cannot hit short intervals; try --pacing auto."
+                              : " The publisher cannot keep up at this rate on this machine.")
+                      << std::endl;
+        }
+    }
     return result;
 }
 
@@ -767,7 +934,11 @@ std::string paramsJson(const Options& opt, uint64_t totalMsgs) {
       << "    \"publish_mode\": \"" << opt.publishMode << "\",\n"
       << "    \"transport\": \"" << opt.transport << "\",\n"
       << "    \"discovery\": \"" << opt.discovery << "\",\n"
-      << "    \"intraprocess\": \"" << opt.intraprocess << "\"";
+      << "    \"intraprocess\": \"" << opt.intraprocess << "\",\n"
+      << "    \"pacing\": \"" << opt.pacing << "\",\n"
+      << "    \"sub_work_us\": " << opt.subWorkUs << ",\n"
+      << "    \"nack_response_delay_us\": " << opt.nackResponseDelayUs << ",\n"
+      << "    \"heartbeat_response_delay_us\": " << opt.heartbeatResponseDelayUs;
     return j.str();
 }
 
@@ -878,6 +1049,10 @@ Options parseArgs(int argc, char** argv) {
         else if (arg == "--discovery-server-port") opt.dsPort = std::stoul(next("--discovery-server-port"));
         else if (arg == "--discovery-server-guid") opt.dsGuid = next("--discovery-server-guid");
         else if (arg == "--intraprocess") opt.intraprocess = next("--intraprocess");
+        else if (arg == "--nack-response-delay-us") opt.nackResponseDelayUs = std::stoi(next("--nack-response-delay-us"));
+        else if (arg == "--heartbeat-response-delay-us") opt.heartbeatResponseDelayUs = std::stoi(next("--heartbeat-response-delay-us"));
+        else if (arg == "--pacing") opt.pacing = next("--pacing");
+        else if (arg == "--sub-work-us") opt.subWorkUs = std::stoi(next("--sub-work-us"));
         else if (arg == "--out") opt.out = next("--out");
         else if (arg == "--match-timeout-sec") opt.matchTimeoutSec = std::stoi(next("--match-timeout-sec"));
         else if (arg == "--idle-timeout-sec") opt.idleTimeoutSec = std::stoi(next("--idle-timeout-sec"));
@@ -927,6 +1102,9 @@ Options parseArgs(int argc, char** argv) {
         opt.publishMode = (opt.size >= kFragmentationThreshold) ? "async" : "sync";
     } else if (opt.publishMode != "sync" && opt.publishMode != "async") {
         fail("--publish-mode must be 'sync', 'async' or 'auto' (got '" + opt.publishMode + "')");
+    }
+    if (opt.pacing != "auto" && opt.pacing != "sleep" && opt.pacing != "busy") {
+        fail("--pacing must be 'auto', 'sleep' or 'busy' (got '" + opt.pacing + "')");
     }
     if (opt.intraprocess != "on" && opt.intraprocess != "off") {
         fail("--intraprocess must be 'on' or 'off' (got '" + opt.intraprocess + "')");
