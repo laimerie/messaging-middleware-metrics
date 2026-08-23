@@ -1,0 +1,77 @@
+{
+  "_comment": [
+    "Scenarios executed by run-all-benchmarks.sh. Each entry: script (a bench-*.sh),",
+    "category, label, and a params object whose keys are that script's flag names in",
+    "kebab-case with the leading '--' removed.",
+    "",
+    "The first six mirror nats/scripts/scenarios.json one-for-one (baseline / large-message",
+    "/ multi-client throughput, RTT check, steady one-way latency, scalability sweep) so the",
+    "two projects' run-index.csv files can be compared row by row. The trailing entries",
+    "cover what has no NATS equivalent at all: RELIABLE QoS, shared-memory transport, and",
+    "many-topic fan-out. Those are where Fast DDS does something NATS Core cannot, so",
+    "leaving them out would make the comparison flattering to NATS by omission."
+  ],
+  "scenarios": [
+    {
+      "category": "throughput",
+      "script": "bench-throughput.sh",
+      "label": "baseline",
+      "params": { "msgs": 100000, "size": 128 }
+    },
+    {
+      "category": "throughput",
+      "script": "bench-throughput.sh",
+      "label": "large-message",
+      "params": { "msgs": 50000, "size": 16384 }
+    },
+    {
+      "category": "throughput",
+      "script": "bench-throughput.sh",
+      "label": "multi-participant",
+      "params": { "msgs": 100000, "pub-count": 4, "sub-count": 4 }
+    },
+    {
+      "category": "latency",
+      "script": "bench-latency.sh",
+      "label": "rtt-quick-check",
+      "params": { "target-msgs-per-sec": 1000, "duration-sec": 5 }
+    },
+    {
+      "category": "latency",
+      "script": "bench-latency-oneway.sh",
+      "label": "steady-1000",
+      "params": { "target-msgs-per-sec": 1000, "duration-sec": 20 }
+    },
+    {
+      "category": "scalability",
+      "script": "bench-scalability.sh",
+      "label": "default-sweep",
+      "params": { "participant-counts": "1,5,10,25", "msgs-per-participant": 5000 }
+    },
+    {
+      "category": "throughput",
+      "script": "bench-throughput.sh",
+      "label": "reliable-baseline",
+      "_comment": "history keep_all is required, not optional: RELIABLE + KEEP_LAST is NOT lossless. RELIABLE guarantees delivery of what the writer still holds, and KEEP_LAST caps that at history-depth samples - measured, an unthrottled 100000-message run lost 679 at depth 100.",
+      "params": { "msgs": 100000, "size": 128, "reliability": "reliable", "history": "keep_all" }
+    },
+    {
+      "category": "latency",
+      "script": "bench-latency-oneway.sh",
+      "label": "reliable-1000",
+      "params": { "target-msgs-per-sec": 1000, "duration-sec": 20, "reliability": "reliable" }
+    },
+    {
+      "category": "latency",
+      "script": "bench-latency-oneway.sh",
+      "label": "shm-1000",
+      "params": { "target-msgs-per-sec": 1000, "duration-sec": 20, "transport": "shm" }
+    },
+    {
+      "category": "throughput",
+      "script": "bench-throughput.sh",
+      "label": "multi-topic",
+      "params": { "msgs": 100000, "size": 128, "topic-count": 50 }
+    }
+  ]
+}

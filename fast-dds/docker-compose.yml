@@ -1,0 +1,61 @@
+# Fast DDS is DAEMONLESS — there is no broker service here, and that is the single biggest
+# structural difference from nats/docker-compose.yml. Participants find each other directly
+# (SIMPLE discovery over multicast) and exchange data peer-to-peer; nothing sits in the
+# middle. Both services below are therefore *clients*, not servers:
+#
+#   dds-bench          the benchmark tool itself (profiles: tools) — publisher role,
+#                      subscriber role, or both, depending on the command passed.
+#   discovery-server   OPTIONAL (profiles: discovery). eProsima's `fast-discovery-server`,
+#                      which replaces multicast discovery with a unicast rendezvous point.
+#                      It brokers DISCOVERY ONLY: once two participants know about each
+#                      other, sample data still flows directly between them and never
+#                      through this process. Use it when multicast is unavailable or
+#                      unreliable — which includes many Docker bridge setups — and as the
+#                      closest structural comparison to NATS's broker topology.
+#
+# Both are on an explicitly-numbered network. That is not cosmetic: Fast DDS locators are
+# IP addresses, not hostnames, so the Discovery Server needs an address that scripts can
+# hardcode. Change the subnet here (and DS_ADDRESS in scripts/common.sh) if 172.28.0.0/24
+# collides with something on your host.
+services:
+  # The benchmark client. `profiles: [tools]` keeps it out of `docker compose up`; invoke
+  # explicitly, e.g.:
+  #   docker compose run --rm dds-bench dds_bench --measure latency --rate 1000 --out /out
+  # cap_add NET_ADMIN: required for entrypoint.sh's `tc netem` delay injection
+  # (bench-crosshost.sh's --netem-delay-ms). Harmless/unused when that isn't set.
+  dds-bench:
+    build:
+      context: .
+      dockerfile: docker/dds-bench/Dockerfile
+    image: fast-dds-bench:local
+    profiles: ["tools"]
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - ddsnet
+
+  # Optional Discovery Server. Started/stopped by scripts/start-discovery-server.sh and
+  # stop-discovery-server.sh; only used when a bench script is given --discovery server.
+  #   -i 0            server id 0, which fixes its GUID prefix at
+  #                   44.53.00.5f.45.50.52.4f.53.49.4d.41 (the default dds_bench expects)
+  #   -l 0.0.0.0      listen on every interface in the container
+  #   -p 11811        the conventional Fast DDS discovery port
+  discovery-server:
+    build:
+      context: .
+      dockerfile: docker/dds-bench/Dockerfile
+    image: fast-dds-bench:local
+    container_name: fast-dds-discovery
+    profiles: ["discovery"]
+    command: ["fast-discovery-server", "-i", "0", "-l", "0.0.0.0", "-p", "11811"]
+    restart: unless-stopped
+    networks:
+      ddsnet:
+        ipv4_address: 172.28.0.10
+
+networks:
+  ddsnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
