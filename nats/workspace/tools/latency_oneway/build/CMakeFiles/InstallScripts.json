@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home2/murai/tmp/messaging_middleware/messaging-middleware-metrics/nats/workspace/tools/latency_oneway/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

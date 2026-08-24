@@ -181,11 +181,11 @@ save_result() {
     jq -n \
         --arg run_id "$(basename "$dir")" \
         --arg category "$category" \
-        --arg label "$label" \
+        --arg lbl "$label" \
         --arg ts "$(date -Iseconds)" \
         --argjson params "$params_json" \
         --argjson metrics "$metrics_json" \
-        '{run_id:$run_id, category:$category, label:$label, timestamp:$ts, params:$params, metrics:$metrics}' \
+        '{run_id:$run_id, category:$category, label:$lbl, timestamp:$ts, params:$params, metrics:$metrics}' \
         > "$dir/result.json"
     add_run_index_entry "$dir" "$category" "$label" "$metrics_json"
 }

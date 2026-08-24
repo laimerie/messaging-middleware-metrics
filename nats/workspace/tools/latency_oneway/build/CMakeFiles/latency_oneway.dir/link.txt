@@ -1,0 +1,1 @@
+/opt/gcc-13.1.0/bin/c++ -O3 -DNDEBUG CMakeFiles/latency_oneway.dir/main_v2.cpp.o -o latency_oneway  /usr/local/lib64/libnats_static.a -lpthread -lrt -ldl

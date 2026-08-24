@@ -116,6 +116,29 @@ overall structure); everything in this file is scoped to `nats/` only. See `READ
 - **Every path in this project uses `/`, never `\`** — this is native Linux Bash, so
   there's no Windows-path concern to design around in the first place (unlike the
   PowerShell predecessor, which needed a deliberate pass for this).
+- **One-way latency has a real, rate-dependent floor that gets *worse* at lower
+  `--target-msgs-per-sec` — this is NATS Core's own behaviour, not a `latency_oneway`
+  bug, and confirmed on real Linux hardware (not just Docker Desktop).** Measured on the
+  same real-Linux host: 100/s → p50 212us, 1000/s → p50 87-104us, 30000-50000/s → p50
+  29-34us, all with `--pacing auto`; forcing `--pacing busy` at 300/s still gave p50
+  111.5us (min 41us) — busy-spin only removes the *publisher's* send-timing jitter, so
+  this residual is NOT scheduling error in `pacedWaitUntil`. Confirmed independently with
+  the stock `nats` CLI (`nats bench service serve`/`request`, a different language/client
+  entirely) at the equivalent low rate: min 91us / p50 173.67us round-trip — roughly
+  double the `latency_oneway` one-way numbers at the same rate, i.e. the same floor shows
+  up in a completely independent Go client, so it is NATS Core's, not this tool's. Root
+  cause: nats.c's subscription delivery is a dedicated dispatch thread woken via a
+  condition variable (not busy-polled) from the socket-reader, and the Go server's
+  per-connection goroutine has the same wake-from-idle shape — at low rates each message
+  pays a full idle-thread wake/context-switch cost on both hops; at high rates back-to-back
+  messages keep those threads runnable and amortize it away. **Do not "fix" this by
+  splitting `--mode pub`/`--mode sub` into separate processes/containers — that changes
+  network topology, not this wake-latency path, and does not close the gap** (confirmed:
+  the effect reproduces identically in `--mode both`, and separating adds a Docker network
+  hop on top if anything). If a cleaner low-rate baseline is ever needed, look at pinning
+  the `nats` container and `latency-tool` to isolated cores (`cpuset`/`--cpus` in
+  `docker-compose.yml`, not currently set) to cut *scheduler noise* — that's a different
+  problem from this rate-dependent floor and won't remove it either.
 
 ## Why Bash, not PowerShell
 

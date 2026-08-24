@@ -35,7 +35,7 @@ source "$SCRIPT_DIR/common.sh"
 TOOL="latency-oneway"
 SUBJECT="BENCH.CROSSHOST"
 MSGS=20000                    # --tool nats-bench only
-TARGET_MSGS_PER_SEC=0         # --tool latency-oneway: 0 -> defaults to 1000 below. --tool nats-bench: 0 = unthrottled
+TARGET_MSGS_PER_SEC=30000         # --tool latency-oneway: 0 -> defaults to 1000 below. --tool nats-bench: 0 = unthrottled
 DURATION_SEC=10               # --tool latency-oneway only
 SIZE=128
 NETEM_DELAY_MS=0

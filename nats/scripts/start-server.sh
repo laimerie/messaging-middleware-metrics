@@ -27,7 +27,7 @@ for port in 4222 8222; do
 done
 
 cd "$PROJECT_ROOT"
-docker compose up -d
+docker compose up -d --build
 
 echo "Waiting for NATS server to become healthy..."
 varz="$(test_nats_server_up 15)"

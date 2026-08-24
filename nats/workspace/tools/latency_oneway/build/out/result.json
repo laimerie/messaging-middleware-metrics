@@ -1,0 +1,32 @@
+{
+  "mode": "both",
+  "measure": "latency",
+  "params": {
+    "subject": "BENCH.LATENCY.ONEWAY",
+    "rate": 30000,
+    "duration_sec": 10,
+    "msgs": 300000,
+    "size": 128,
+    "pacing": "busy"
+  },
+  "environment": {
+    "latency_tool_version": "latency_oneway 0.3.0_pacing",
+    "nats_c_version": "3.13.0"
+  },
+  "metrics": {
+    "msgs_sent": 300000,
+    "msgs_received": 299998,
+    "msg_loss": 2,
+    "latency_us": {
+      "min": 17.433,
+      "avg": 49.8088,
+      "p50": 27.096,
+      "p90": 30.402,
+      "p95": 31.389,
+      "p99": 67.209,
+      "p999": 8986.44,
+      "max": 15891.9,
+      "stddev": 444.917
+    }
+  }
+}
