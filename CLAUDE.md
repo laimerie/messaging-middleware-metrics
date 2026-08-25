@@ -5,7 +5,8 @@ for the current subproject list.
 
 ## 構成の原則
 
-- **ミドルウェアごとにトップレベルのサブディレクトリを持つ**（例: `nats/`、`fast-dds/`）。各
+- **ミドルウェアごとにトップレベルのサブディレクトリを持つ**（例: `nats/`、`fast-dds/`、
+  `aeron/`）。各
   サブディレクトリは自己完結させる — 自分専用の`docker-compose.yml`／`scripts/`／`results/`／
   `README.md`／`TODO.md`／`CLAUDE.md`を持ち、他のサブディレクトリの結果やスクリプトと混ぜない。
 - **サブディレクトリ固有の規約はそのディレクトリの`CLAUDE.md`に書く**（このファイルには書かない）。
