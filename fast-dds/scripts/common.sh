@@ -36,8 +36,12 @@ export MSYS2_ARG_CONV_EXCL="/out"
 # Discovery Server coordinates. The address is fixed in docker-compose.yml rather than
 # resolved by name because Fast DDS locators are IP addresses - a hostname cannot be put
 # into a locator at all. Keep these two in sync if you change the compose network.
-DS_ADDRESS="172.28.0.10"
-DS_PORT=11811
+# Overridable from the environment: the compose default only exists inside this host's
+# bridge network, so a two-server run (scripts/bench-rtt-2host.sh) must be pointed at the
+# Discovery Server's real, routable address instead:
+#   DS_ADDRESS=10.0.0.7 ./scripts/bench-rtt-2host.sh --role ping --discovery server ...
+DS_ADDRESS="${DS_ADDRESS:-172.28.0.10}"
+DS_PORT="${DS_PORT:-11811}"
 DS_CONTAINER="fast-dds-discovery"
 
 # ---------------------------------------------------------------------------------------

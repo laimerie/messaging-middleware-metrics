@@ -53,6 +53,43 @@ services:
       ddsnet:
         ipv4_address: 172.28.0.10
 
+  # --- Two-REAL-SERVER variants (profiles: host) -----------------------------------------
+  #
+  # Everything above runs both roles on ONE Docker host, which is fine for same-host
+  # measurement but does NOT reproduce host-to-host latency (no NIC, no switch, no wire —
+  # see README.md). These two exist for running one role on each of two real servers.
+  #
+  # `network_mode: host` is not a convenience here, it is a requirement. RTPS advertises
+  # LOCATORS — literal IP addresses a peer is told to send to. On the default bridge a
+  # container advertises its private address (confirmed: 172.28.0.2), which the other
+  # server cannot route to, so discovery completes and then no data ever arrives. Host
+  # networking makes the container advertise the server's real interface addresses.
+  # Port publishing is not a workaround: RTPS picks ports dynamically per participant.
+  #
+  # Invoked by scripts/bench-rtt-2host.sh; run that on each server separately.
+  dds-bench-host:
+    build:
+      context: .
+      dockerfile: docker/dds-bench/Dockerfile
+    image: fast-dds-bench:local
+    profiles: ["host"]
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+
+  # Discovery Server reachable from another server. Only needed when SIMPLE (multicast)
+  # discovery does not cross the LAN — try simple first, it usually works within a subnet.
+  discovery-server-host:
+    build:
+      context: .
+      dockerfile: docker/dds-bench/Dockerfile
+    image: fast-dds-bench:local
+    container_name: fast-dds-discovery-host
+    profiles: ["host"]
+    network_mode: host
+    command: ["fast-discovery-server", "-i", "0", "-l", "0.0.0.0", "-p", "11811"]
+    restart: unless-stopped
+
 networks:
   ddsnet:
     driver: bridge

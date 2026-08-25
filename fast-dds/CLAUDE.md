@@ -73,6 +73,29 @@ That is what makes them worth writing down.
   cannot take `discovery-server` as a Docker DNS name. That is why `docker-compose.yml`
   pins a subnet and a static `ipv4_address`, and why `DS_ADDRESS` in `common.sh` is a
   literal. The two must stay in sync.
+- **Separate containers are NOT a stand-in for separate servers, and the data says so.**
+  Crossing the container boundary cost nothing measurable (p50 70µs same-process vs 68µs
+  cross-container) because veth + a Linux bridge is an in-kernel memcpy — no NIC, no wire,
+  no switch. Never present a `bench-crosshost.sh` number as a host-to-host figure.
+- **One-way latency across two REAL servers is not measurable with `steady_clock`.** It is
+  `CLOCK_MONOTONIC`, whose epoch is arbitrary per host, so the subtraction is meaningless
+  across machines — and it fails silently, producing plausible or negative latencies
+  (negative values were actually observed on real hardware). Same-host containers are fine
+  because they share one kernel clock. `scripts/bench-rtt-2host.sh` sidesteps this by
+  measuring round-trip with the ping side's own clock only. A true cross-host one-way
+  figure needs PTP **and** a tool change: PTP disciplines `CLOCK_REALTIME`, not
+  `CLOCK_MONOTONIC`, so the current tool would not benefit even from perfect PTP sync
+  (TODO.md #6).
+- **Cross-server runs require `network_mode: host`** (compose services `dds-bench-host` /
+  `discovery-server-host`). RTPS advertises LOCATORS — literal IPs the peer is told to send
+  to — so on a bridge a container advertises its private address (confirmed: 172.28.0.2)
+  and the peer cannot route to it. The failure mode is the nasty one: discovery succeeds,
+  endpoints match, and then no data ever arrives. Publishing ports is not a workaround;
+  RTPS allocates ports dynamically per participant.
+- **`--profile` is a `docker compose` global flag, not a `run` flag.** `docker compose run
+  --profile X svc` fails; it must be `docker compose --profile X run svc`. In practice
+  `docker compose run <svc>` auto-enables that service's own profiles, so `run` needs no
+  profile flag at all — only `up` does (see `ensure_discovery_server`).
 - **UDP multicast over a Docker bridge is unreliable** (IGMP snooping, `br_netfilter`, host
   kernel config), so cross-container SIMPLE discovery may or may not work on a given
   machine. This is a Docker property, not a Fast DDS one. `smoke-test.sh` tests it
