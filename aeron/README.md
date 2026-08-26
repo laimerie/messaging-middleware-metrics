@@ -301,9 +301,11 @@ veth ＋ Linux ブリッジ（カーネル内メモリコピー）で通信す�
 
 **実サーバー 2 台では、それぞれの `steady_clock` は無関係な起点を持つ別の時計。** 差分に意味は
 無く、しかもエラーにならず**それらしい値や負の値が出る**（`fast-dds/` で実際に負の値が観測
-されている）。真の片道測定には PTP（IEEE 1588）が必要で、しかも PTP が規律するのは
-`CLOCK_REALTIME` であって `CLOCK_MONOTONIC` ではないため、ツール側の改修も要る
-（`TODO.md` #5）。
+されている）。
+
+真の片道測定には PTP（IEEE 1588）が必要で、しかも **PTP が規律するのは `CLOCK_REALTIME` で
+あって `CLOCK_MONOTONIC` ではない**。そのため `aeron_bench` には `--clock` があり、
+`bench-oneway-2host.sh`（後述）がこれを使う。
 
 ### `bench-rtt-2host.sh` — 時計同期なしで測れる往復レイテンシ
 
@@ -334,6 +336,106 @@ RTT なら ping 側が**自分の時計だけ**で送信・受信を計測する
 **RTT の解釈に関する注意**: RTT にはエコー側の「受信して打ち返す」処理コストが含まれる。
 したがって **RTT ÷ 2 は片道レイテンシを過大に見積もる。** 上限の把握や相対比較には使えるが、
 片道の実数値として報告しないこと。
+
+### `bench-oneway-2host.sh` — PTP 同期環境での真の片道レイテンシ
+
+**Docker を使わずネイティブに実行する。** 対象の 2 台が Docker を使えないケースを想定した
+唯一の経路で、`scripts/package-native.sh` が作る tarball のバイナリを使う（後述）。
+
+```bash
+# サーバーB（受信側 = 計測結果が出る側）を先に起動
+./scripts/bench-oneway-2host.sh --role sub \
+  --self-address 10.0.0.2 --peer-address 10.0.0.1 \
+  --target-msgs-per-sec 10000 --duration-sec 30 --label prod-profile
+
+# サーバーA（送信側）
+./scripts/bench-oneway-2host.sh --role pub \
+  --self-address 10.0.0.1 --peer-address 10.0.0.2 \
+  --target-msgs-per-sec 10000 --duration-sec 30
+```
+
+- **計測結果は `--role sub` 側に出る。** `bench-rtt-2host.sh` が ping 側（＝pub）で計測するのと
+  逆で、これは片道レイテンシの定義そのものから来る — publisher が時刻を刻み、**subscriber が
+  受信時に引き算する**ので、両方の値を持っているのは subscriber だけ。pub 側にも
+  `result.json` は出るが送信側カウンタしか入っていない。
+- **既定で `--clock realtime`。** PTP が規律するのは `CLOCK_REALTIME` なので、この経路だけは
+  既定を変えてある。`--clock monotonic` も渡せるが、2 台構成では**壊れた測定を意図的に
+  再現する**ためのものでしかない。
+- 両側に同じ `--target-msgs-per-sec` と `--duration-sec` を渡すこと。ポートは 1 つでよい
+  （応答チャネルが無いため。RTT 版は 2 つ必要だった）。
+- **`--force-clean`**: `AERON_DIR` に前回の残骸がある場合のみ使う。既定では**削除せずエラーに
+  する** — 実機では他のドライバが生きている可能性があり、mmap 中のファイルを消すと無言で壊れる。
+
+#### PTP の精度がそのまま誤差棒になる
+
+**片道が数十 µs のオーダーなので、同期精度が測定の意味を決める。**
+
+- スクリプトは実行前に `ethtool -T` で**ハードウェアタイムスタンプ**の有無を確認し、無ければ
+  警告する。ソフトウェアタイムスタンプだけの PTP は誤差が数十 µs あり、**測ろうとしている量と
+  同じ桁**になる。その場合は `bench-rtt-2host.sh`（同期不要）に戻る判断が正しい。
+- `pmc` があれば `master_offset` を**実行前後**に取得して `meta.json` の `ptp` に記録する。
+  実行中に動いた場合、それ自体が分布がおかしい説明になる。
+- **両側のオフセットを合わせて見ること。** 誤差棒は片方ではなく**2 台の和**で押さえられる。
+  pub 側スクリプトは自分のオフセットを表示して、その旨を注意する。
+- **負のレイテンシが 1 件でも出たら同期が壊れている。** ツールが件数と最悪値を出して、
+  どちらの時計が原因かまで明示する。これが無いと、**それらしい p50 が出て気づけない**
+  （`fast-dds/` で実際に負値が観測された失敗）。
+
+#### 検算
+
+片道を A→B と B→A の両方向で測り、`bench-rtt-2host.sh` の RTT と突き合わせる。同期が効いて
+いれば両方向はほぼ対称になり、**非対称分がそのまま時計オフセット誤差の読み取り値**になる。
+数分で終わる決定的なチェックなので必ず行うこと。
+
+## Docker が使えないサーバーへの配布
+
+`package-native.sh` が、コンテナでビルドしたバイナリを自己完結した tarball にまとめる。
+
+```bash
+./scripts/package-native.sh            # -> dist/aeron-bench-native-<version>.tar.gz （約 1MB）
+
+# 両サーバーで
+tar -xzf aeron-bench-native-1.52.2.tar.gz
+cd aeron-bench-native-1.52.2
+./preflight.sh                          # arch / glibc / ライブラリ解決 / PTP を検査
+```
+
+**ターゲット上でビルドしない**のは意図的で、理由は 2 つある。gcc 11 と CMake 3.31 を入れられ
+ない可能性が高いことに加えて、より重要なのは、**別のツールチェーンでビルドした時点で
+`nats/`・`fast-dds/` との比較可能性が壊れる**こと（3 プロジェクトの数値は全て
+CentOS 7 / gcc 11 / C++17 のクライアントランタイムで測られている）。
+
+移植性は推測ではなく実測で確認してある:
+
+| 項目 | 状況 |
+| --- | --- |
+| glibc | CentOS 7 の 2.17 でビルド。**glibc は後方互換**なので、より新しいホストで動く。有名な `GLIBC_2.34 not found` は逆方向（新しい環境でビルド→古い環境で実行）の失敗 |
+| libstdc++ | `-static-libstdc++ -static-libgcc` で畳み込み済み。**GLIBCXX の要求が 0 個**になり、この問題自体が消える。`libaeron`/`libaeron_driver` は純 C で C++ ABI が `.so` 境界をまたがないため、静的リンクの副作用も無い |
+| Aeron のライブラリ | `lib/` に同梱し、RPATH `$ORIGIN/../lib` で解決。`LD_LIBRARY_PATH` は不要 |
+| 検証 | **Ubuntu 22.04（glibc 2.35）のクリーンな環境**に展開して、2 コンテナ間で `bench-oneway-2host.sh` の pub/sub を実際に通し、欠落 0 で完走することを確認済み |
+
+前提は **x86_64 / glibc 2.17 以上 / `jq` / `awk`** のみ。`preflight.sh` がこれを全部その場で
+検査する。tarball は単一ファイル約 1MB なので、`scp` が使えない環境でも運べる
+（`.sha256` を添えてある）。
+
+### ネイティブ実行で自分でやる必要があること
+
+コンテナが黙ってやってくれていたことが 3 つある。`scripts/common-native.sh` が引き受けるが、
+**何が起きているかは知っておくこと**:
+
+1. **ドライバの停止。** `docker compose run` の終了が後始末をしていた。ネイティブでは
+   Ctrl-C やスクリプト異常終了で `aeronmd` が残り、既定の `--driver-idle noop` なので
+   **3 コアを 100% で回し続ける**。スクリプトは `trap` で確実に止める。万一残ったら
+   `pkill -x aeronmd`。
+2. **`AERON_DIR` の初期化。** コンテナは毎回まっさらなので `AERON_DIR_DELETE_ON_START` を
+   無条件に設定できた。実機ではその前提が成り立たないため、**残骸があればエラーで止める**
+   （`--force-clean` で明示的に上書き）。
+3. **結果の取り出し。** `docker cp` が無いので、ツールが実行ディレクトリに直接書く。
+
+なお **Docker が使えないのは測定の質としてはむしろ好都合**である。cgroup の CPU quota による
+スロットリング、既定 capability に `CAP_SYS_NICE` が無いこと、seccomp のフィルタ、
+`network_mode: host` では compose から `net.*` sysctl を設定できないこと — これらの
+コンテナ由来の懸念が全て消える。
 
 ## 一括実行
 
@@ -404,8 +506,14 @@ results/run-index.csv                     # 全カテゴリ横断で1行/実行�
 | `not_connected_events` | subscriber がまだ居らず送れなかった回数 |
 | `linger_sec` | publisher 単独モードで送信後に待った時間 |
 
-`environment` には `driver_threading_mode` と `driver_idle_strategy` が記録される。
-**後者を見ずに result.json のレイテンシを読んではいけない**（8〜14 倍変わる）。
+`environment` には `driver_threading_mode`・`driver_idle_strategy`・`clock` が記録される。
+**`driver_idle_strategy` を見ずに result.json のレイテンシを読んではいけない**（8〜14 倍変わる）。
+`clock` が `realtime` の行は 2 台構成の片道測定であり、**`meta.json` の `ptp` と必ずセットで
+読むこと** — PTP の残留オフセットがその数値の誤差棒そのもの。
+
+ネイティブ実行（`bench-oneway-2host.sh`）の `meta.json` はコンテナ実行と別の内容を持つ:
+`image` は `"none (native binaries)"`、`server` は `"aeronmd native (no container)"`、
+加えて `host`（カーネルとホスト名）と `ptp`（実行前後の `master_offset`）が入る。
 
 ## `aeron_bench` の直接実行
 
@@ -428,8 +536,30 @@ docker compose run --rm aeron-bench aeron_bench \
 | `--pub-count` / `--sub-count` | publisher / subscriber の Aeron クライアント数 |
 | `--size` | 1 メッセージのペイロードバイト数（先頭 16 バイトが seq + タイムスタンプ） |
 | `--linger-sec` | publisher 単独モードで送信後に待つ時間（既定 2 秒、後述） |
+| `--clock monotonic\|realtime` | メッセージに埋め込む時刻の時計（既定 `monotonic`、下記） |
 | `--aeron-dir` | メディアドライバのディレクトリ（既定は `$AERON_DIR`） |
 | `--out` | 出力ディレクトリ |
+
+### `--clock` — 2 つの時計は交換可能ではない
+
+**ペーシング・タイムアウト・`--linger-sec`・実行時間の計測は常に `CLOCK_MONOTONIC` で、
+`--clock` はこれを一切変えない。** 変えるのは**メッセージの中に入って相手プロセスに引き算
+される時刻**だけ。単調時計を丸ごと差し替えるのは誤った直し方で、区間計測に「NTP/PTP が
+巻き戻し得る時計」を渡すことになる。
+
+| 値 | 正しく使える条件 |
+| --- | --- |
+| `monotonic`（既定） | 送受信が**同じカーネルを共有**しているとき。`--mode both`、および同一 Docker ホスト上の 2 コンテナ |
+| `realtime` | 実サーバー 2 台で、**PTP/NTP により `CLOCK_REALTIME` が同期している**とき |
+
+`--clock realtime` は **`--measure latency` 以外では明示的にエラーになる。**
+
+- `--measure throughput` — 片道レイテンシを計算しないので効果が無い
+- `--measure rtt` — **これは制限ではなく正しさの規則。** ping 側は自分の時計だけで刻んで
+  引き算するので RTT はそもそも同期不要であり、規律された時計を使うと「実行中に PTP が
+  step すると跨いだサンプルが壊れる」という失敗要因が増えるだけになる
+
+`result.json` の `environment.clock` に必ず記録される。
 
 ### `--measure latency` に `--msgs` が無い理由
 

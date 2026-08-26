@@ -61,3 +61,24 @@ C++ / CentOS 7 / gcc 11 / C++17 で統一しており、クライアントラン
 
 比較レポート自体はまだ作成していない（[`fast-dds/TODO.md`](fast-dds/TODO.md) #2、
 [`aeron/TODO.md`](aeron/TODO.md) #2）。
+
+## 実サーバー2台での片道レイテンシ（3プロジェクト共通の落とし穴）
+
+**同一ホストでの片道測定が成立しているのは、送受信が同じカーネルの単調時計を共有している
+から。** 実サーバー2台では`CLOCK_MONOTONIC`の起点が無関係なので差分に意味が無く、しかも
+**エラーにならず、それらしい値や負の値が出る**（`fast-dds/`で実際に負値が観測されている）。
+
+さらに間違えやすい点として、**PTPが規律するのは`CLOCK_REALTIME`であって`CLOCK_MONOTONIC`
+ではない。** PTP同期が完璧でも、単調時計で計測しているツールは一切恩恵を受けない。
+
+| | 状態 |
+| --- | --- |
+| `aeron/` | **対応済み。** `aeron_bench --clock realtime` と `scripts/bench-oneway-2host.sh`。対象2台がDockerを使えないため、ネイティブ実行経路と配布用tarball（`scripts/package-native.sh`）も含む |
+| `fast-dds/` | 未対応（[`fast-dds/TODO.md`](fast-dds/TODO.md) #6）。対応するなら`aeron/`の実装をそのまま流用できる |
+| `nats/` | 未対応 |
+
+**ただし、多くの場合そもそも不要**である点は変わらない。ミドルウェア比較は同一ホストで
+測る方が適切（同条件・時計同期不要）であり、実配置の要件検証は「同一ホストの
+ミドルウェアコスト ＋ ネットワーク単独のコスト」に分解でき、後者は`sockperf`や
+`netperf -t UDP_RR`でミドルウェア抜きに測れる。RTTで足りるなら時計同期は一切要らない。
+詳細は[`aeron/README.md`](aeron/README.md)の該当節。

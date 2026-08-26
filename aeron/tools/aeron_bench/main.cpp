@@ -49,11 +49,40 @@
 //    and is recorded in result.json. A sleeping poll loop makes Aeron look slow; that is
 //    the measurement's fault, not Aeron's.
 //
-//  * std::chrono::steady_clock is a HOST-wide monotonic clock, so pub/sub timestamps stay
-//    directly comparable across separate containers on one Docker host (they share a
-//    kernel). Genuinely separate physical hosts have unrelated epochs — the subtraction
-//    would fail SILENTLY, producing plausible or negative values. Use --measure rtt there
-//    (scripts/bench-rtt-2host.sh), exactly as on the Fast DDS side.
+//  * THERE ARE TWO CLOCKS HERE AND THEY ARE NOT INTERCHANGEABLE. Read this before touching
+//    either.
+//
+//    `Clock` (std::chrono::steady_clock, CLOCK_MONOTONIC) measures INTERVALS: pacing,
+//    timeouts, --linger-sec, --sub-work-us, the per-second receive buckets, the run's own
+//    duration. It must stay monotonic. A realtime clock can be STEPPED backwards by NTP or
+//    PTP mid-run, which would corrupt every one of those.
+//
+//    `wireNowNs()` produces the timestamp that travels INSIDE the message and is subtracted
+//    on receipt to give one-way latency. That one has to be comparable across the two
+//    processes doing the subtracting, which is a different requirement:
+//
+//      --clock monotonic (default)  Both roles read the same kernel's CLOCK_MONOTONIC, so
+//                                   this is correct — and only correct — when they share a
+//                                   kernel: --mode both, or two containers on ONE Docker
+//                                   host. Two physical servers have unrelated monotonic
+//                                   epochs and the subtraction fails SILENTLY, producing
+//                                   plausible-looking or frankly negative values (negative
+//                                   ones were actually observed on the Fast DDS side).
+//      --clock realtime             CLOCK_REALTIME, which is what PTP (IEEE 1588) and NTP
+//                                   discipline. This is what makes a genuine cross-server
+//                                   one-way measurement possible — see
+//                                   scripts/bench-oneway-2host.sh. PTP does NOT discipline
+//                                   CLOCK_MONOTONIC, which is exactly why swapping `Clock`
+//                                   wholesale would be the wrong fix: it would hand the
+//                                   interval measurements a steppable clock while still
+//                                   leaving the wire timestamp unsynchronised on any host
+//                                   where PTP was not actually running.
+//
+//    The residual PTP offset between the two servers is the ERROR BAR on every number a
+//    --clock realtime run produces. scripts/bench-oneway-2host.sh records it (before and
+//    after the run) into meta.json for exactly that reason; a one-way figure without it
+//    cannot be interpreted. When RTT is good enough, --measure rtt needs no synchronisation
+//    at all and stays the safer choice (scripts/bench-rtt-2host.sh).
 
 #include <Aeron.h>
 #include <FragmentAssembler.h>
@@ -96,6 +125,28 @@ constexpr auto kPacingSpinGuard = std::chrono::microseconds(200);
 std::int64_t nowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
         .count();
+}
+
+// --- The wire clock (see the header comment: two clocks, not interchangeable) -------------
+//
+// Set once from --clock before any thread starts and only read afterwards, so a plain bool
+// is enough - no atomic, no synchronisation on the hot path.
+bool g_wireClockRealtime = false;
+
+std::int64_t realtimeNowNs() {
+    // system_clock is CLOCK_REALTIME on every libstdc++ target, which is the clock PTP and
+    // NTP discipline. Its epoch is the Unix epoch, so two PTP-synchronised servers produce
+    // directly subtractable values.
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// The timestamp that goes into the message header. Takes the monotonic reading the caller
+// already had to take anyway, so the default path costs one predictable branch rather than a
+// second clock read; only --clock realtime pays for the extra (vDSO) clock_gettime.
+inline std::int64_t wireNowNs(std::int64_t monotonicNs) {
+    return g_wireClockRealtime ? realtimeNowNs() : monotonicNs;
 }
 
 [[noreturn]] void fail(const std::string& what) {
@@ -185,6 +236,13 @@ struct Options {
     // back); it converts into back-pressure on the publisher instead, which is precisely
     // the thing worth demonstrating.
     int subWorkUs = 0;
+
+    // Which clock the in-message timestamp is taken from. This does NOT change the clock
+    // used for pacing, timeouts or durations - those are always monotonic. See wireNowNs().
+    //   monotonic  correct only when both roles share a kernel (default)
+    //   realtime   required for a cross-server one-way run, and only meaningful when the
+    //              two servers are PTP/NTP synchronised
+    std::string clock = "monotonic";  // monotonic | realtime
 
     std::string aeronDir;  // empty = Aeron's own default / $AERON_DIR
     std::string out = ".";
@@ -310,7 +368,12 @@ public:
 
     void onFragment(const aeron::AtomicBuffer& buffer, aeron::util::index_t offset,
                     aeron::util::index_t length) {
+        // recvNs is MONOTONIC and stays that way: firstNs_/lastNs_ and the per-second
+        // buckets below are intervals, and a stepped clock would corrupt all of them.
+        // recvWireNs is whatever --clock selected, and is used ONLY for the subtraction
+        // against the sender's timestamp. Under the default they are the same reading.
         const std::int64_t recvNs = nowNs();
+        const std::int64_t recvWireNs = wireNowNs(recvNs);
         const std::uint64_t n = count_.load(std::memory_order_relaxed);
         if (n == 0) firstNs_ = recvNs;
         lastNs_ = recvNs;
@@ -325,7 +388,7 @@ public:
             std::memcpy(&sendNs, src + sizeof(seq), sizeof(sendNs));
         }
         if (keepSamples_) {
-            samples_.push_back({seq, static_cast<double>(recvNs - sendNs) / 1000.0});
+            samples_.push_back({seq, static_cast<double>(recvWireNs - sendNs) / 1000.0});
         }
 
         // Per-second receive buckets: cheap, and the only way to tell whether a throughput
@@ -681,7 +744,9 @@ bool offerWithRetry(Pub& pub, aeron::AtomicBuffer& buffer, std::int32_t length,
     bool retried = false;
     const auto retryStart = Clock::now();
     while (true) {
-        const std::int64_t ts = nowNs();
+        // The wire clock, not the interval clock - this value is subtracted by the RECEIVING
+        // process, which may be on another server. See wireNowNs().
+        const std::int64_t ts = wireNowNs(nowNs());
         std::memcpy(buffer.buffer(), &seq, sizeof(seq));
         std::memcpy(buffer.buffer() + sizeof(seq), &ts, sizeof(ts));
 
@@ -900,6 +965,43 @@ double percentile(const std::vector<double>& sorted, double p) {
     return sorted[std::min(idx, sorted.size() - 1)];
 }
 
+// A NEGATIVE one-way latency is physically impossible, so it is proof that the two clocks
+// being subtracted are not the same clock. This is the single most important check in a
+// cross-server run, because the failure it catches is otherwise SILENT: an unsynchronised
+// pair does not error, it produces a plausible-looking distribution shifted by the offset,
+// and only the samples where the offset exceeds the true latency come out negative. Fast DDS
+// hit exactly this on real hardware. Reported, not fatal: the run's raw samples are still
+// worth keeping, and the caller may be deliberately measuring how bad the skew is.
+void warnIfClockLooksUnsynchronised(const Options& opt, const std::vector<Sample>& samples) {
+    std::size_t negatives = 0;
+    double worst = 0.0;
+    for (const auto& s : samples) {
+        if (s.latency_us < 0.0) {
+            ++negatives;
+            if (s.latency_us < worst) worst = s.latency_us;
+        }
+    }
+    if (negatives == 0) return;
+
+    std::cerr << "WARNING: " << negatives << " of " << samples.size()
+              << " samples have NEGATIVE latency (worst " << worst
+              << "us). A message cannot arrive before it was sent - the sending and receiving"
+              << " clocks are not synchronised, and EVERY number in this run is shifted by"
+              << " that offset.\n";
+    if (opt.clock == "realtime") {
+        std::cerr << "         --clock realtime was used, so CLOCK_REALTIME is the clock at"
+                  << " fault: check that ptp4l is running and locked on BOTH servers, and that"
+                  << " phc2sys is stepping the system clock from the PHC. An offset of"
+                  << " " << (-worst) << "us or more would explain this.\n";
+    } else {
+        std::cerr << "         --clock monotonic was used. That is only valid when both roles"
+                  << " share a kernel. If these are two separate servers, this run is"
+                  << " meaningless: use --clock realtime with PTP (scripts/"
+                  << "bench-oneway-2host.sh), or --measure rtt, which needs no"
+                  << " synchronisation at all.\n";
+    }
+}
+
 LatencyStats computeStats(std::vector<double> latencies) {
     LatencyStats st;
     if (latencies.empty()) return st;
@@ -990,6 +1092,11 @@ std::string environmentJson() {
       << "    \"driver_threading_mode\": \"" << (threading != nullptr ? threading : "default")
       << "\",\n"
       << "    \"driver_idle_strategy\": \"" << (idle != nullptr ? idle : "default") << "\",\n"
+      // Which clock produced the in-message timestamps. A latency figure cannot be read
+      // without it: "realtime" means the number is only as good as the PTP synchronisation
+      // between the two servers (whose residual offset meta.json records), while "monotonic"
+      // means the two roles MUST have shared a kernel for it to mean anything at all.
+      << "    \"clock\": \"" << (g_wireClockRealtime ? "realtime" : "monotonic") << "\",\n"
       << "    \"runtime\": \"CentOS 7 / gcc 11 / C++17\"";
     return j.str();
 }
@@ -1105,6 +1212,7 @@ Options parseArgs(int argc, char** argv) {
         else if (arg == "--fragment-limit") opt.fragmentLimit = std::stoi(next("--fragment-limit"));
         else if (arg == "--pacing") opt.pacing = next("--pacing");
         else if (arg == "--sub-work-us") opt.subWorkUs = std::stoi(next("--sub-work-us"));
+        else if (arg == "--clock") opt.clock = next("--clock");
         else if (arg == "--aeron-dir") opt.aeronDir = next("--aeron-dir");
         else if (arg == "--out") opt.out = next("--out");
         else if (arg == "--connect-timeout-sec") opt.connectTimeoutSec = std::stoi(next("--connect-timeout-sec"));
@@ -1139,6 +1247,29 @@ Options parseArgs(int argc, char** argv) {
         fail("--measure rtt needs a distinct response channel per side; use --transport udp "
              "(or --transport ipc for a same-container run).");
     }
+
+    // --clock only changes the in-message timestamp, so it is meaningful only where that
+    // timestamp is subtracted by a DIFFERENT process than the one that wrote it. Rejecting it
+    // elsewhere rather than ignoring it is deliberate: a flag that silently does nothing is
+    // how a run ends up labelled "PTP one-way" while having measured something else.
+    if (opt.clock != "monotonic" && opt.clock != "realtime") {
+        fail("--clock must be 'monotonic' or 'realtime' (got '" + opt.clock + "')");
+    }
+    if (opt.clock == "realtime") {
+        if (opt.measure == "throughput") {
+            fail("--clock realtime is not accepted with --measure throughput: no one-way "
+                 "latency is computed there, so the flag would have no effect.");
+        }
+        if (opt.measure == "rtt") {
+            fail("--clock realtime is not accepted with --measure rtt, and this is a "
+                 "correctness rule rather than a restriction. The ping side stamps and "
+                 "subtracts with its OWN clock, so RTT needs no synchronisation at all - "
+                 "that is the whole point of measuring it. Using a disciplined clock would "
+                 "only add a failure mode: a PTP step landing mid-run would corrupt the "
+                 "samples that straddle it.");
+        }
+    }
+    g_wireClockRealtime = (opt.clock == "realtime");
 
     if (opt.measure == "latency" || opt.measure == "rtt") {
         // Same rule as nats/tools/latency_oneway and fast-dds/tools/dds_bench: rate and
@@ -1283,6 +1414,7 @@ int runPubSub(const Options& opt) {
         for (const auto& s : sub.samples) values.push_back(s.latency_us);
         stats = computeStats(std::move(values));
         writeSampleCsv(opt.out + "/oneway.csv", "LatencyMicros", sub.samples);
+        warnIfClockLooksUnsynchronised(opt, sub.samples);
     }
     if (opt.measure == "throughput" && !subGroups.empty()) {
         writeBucketCsv(opt.out + "/throughput.csv", sub.buckets, opt.size);
