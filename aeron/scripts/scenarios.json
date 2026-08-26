@@ -1,0 +1,86 @@
+{
+  "_comment": [
+    "Scenarios executed by run-all-benchmarks.sh. Each entry: script (a bench-*.sh),",
+    "category, label, and a params object whose keys are that script's flag names in",
+    "kebab-case with the leading '--' removed.",
+    "",
+    "The first six mirror nats/scripts/scenarios.json and fast-dds/scripts/scenarios.json",
+    "one-for-one (baseline / large-message / multi-client throughput, RTT check, steady",
+    "one-way latency, scalability sweep) so the three projects' run-index.csv files can be",
+    "compared row by row.",
+    "",
+    "The trailing entries cover what is specific to Aeron. Two of them exist to keep the",
+    "comparison honest in opposite directions: 'ipc-1000' is Aeron doing something NATS Core",
+    "cannot (shared memory, ~2us), and 'stock-driver-defaults' is Aeron measured WITHOUT the",
+    "low-latency media driver settings this project turns on by default. Leaving the first",
+    "out would flatter NATS by omission; leaving the second out would flatter Aeron, because",
+    "every other row here is measured with a busy-spinning driver that an out-of-the-box",
+    "deployment does not have. Measured gap: p50 21-41us (noop) vs 245-331us (backoff), i.e. 8-14x."
+  ],
+  "scenarios": [
+    {
+      "category": "throughput",
+      "script": "bench-throughput.sh",
+      "label": "baseline",
+      "params": { "msgs": 100000, "size": 128 }
+    },
+    {
+      "category": "throughput",
+      "script": "bench-throughput.sh",
+      "label": "large-message",
+      "params": { "msgs": 50000, "size": 16384 }
+    },
+    {
+      "category": "throughput",
+      "script": "bench-throughput.sh",
+      "label": "multi-client",
+      "params": { "msgs": 100000, "pub-count": 4, "sub-count": 4, "poll-idle": "yield" }
+    },
+    {
+      "category": "latency",
+      "script": "bench-latency.sh",
+      "label": "rtt-quick-check",
+      "params": { "target-msgs-per-sec": 1000, "duration-sec": 5 }
+    },
+    {
+      "category": "latency",
+      "script": "bench-latency-oneway.sh",
+      "label": "steady-1000",
+      "params": { "target-msgs-per-sec": 1000, "duration-sec": 20 }
+    },
+    {
+      "category": "scalability",
+      "script": "bench-scalability.sh",
+      "label": "default-sweep",
+      "_comment": "poll-idle yield, not the default busy: 25 busy-spinning subscriber threads plus the driver's 3 exceed the core count on any ordinary machine, and oversubscribing there does not just slow the result down - the clients can time out against the driver and abort. msgs-per-sub is 20000 rather than fast-dds/'s 5000 because Aeron is fast enough that 5000 messages complete in ~10ms, which is startup noise rather than a steady state.",
+      "params": { "sub-counts": "1,5,10,25", "msgs-per-sub": 20000, "poll-idle": "yield" }
+    },
+    {
+      "category": "latency",
+      "script": "bench-latency-oneway.sh",
+      "label": "ipc-1000",
+      "_comment": "aeron:ipc - shared memory through the driver's term buffers, bypassing the sender/receiver threads and the kernel UDP stack entirely. No NATS Core counterpart; the Fast DDS counterpart is --transport shm.",
+      "params": { "target-msgs-per-sec": 1000, "duration-sec": 20, "transport": "ipc" }
+    },
+    {
+      "category": "latency",
+      "script": "bench-latency-oneway.sh",
+      "label": "stock-driver-defaults",
+      "_comment": "The same run as steady-1000 but with Aeron's OWN defaults for the media driver's idle strategy and a sleeping poll loop. This is what an unconfigured deployment gets, and it is the honest counterweight to every other row in this file.",
+      "params": { "target-msgs-per-sec": 1000, "duration-sec": 20, "driver-idle": "backoff", "poll-idle": "sleep" }
+    },
+    {
+      "category": "throughput",
+      "script": "bench-throughput.sh",
+      "label": "multi-stream",
+      "params": { "msgs": 100000, "size": 128, "stream-count": 50 }
+    },
+    {
+      "category": "throughput",
+      "script": "bench-throughput.sh",
+      "label": "slow-subscriber",
+      "_comment": "sub-work-us simulates application processing per message. Under Fast DDS BEST_EFFORT this would show up as msg_loss; under Aeron it shows up as back-pressure on the publisher and a lower achieved rate, with loss still zero. That difference is the point of the scenario. term-length 64k is REQUIRED, not tuning: at Aeron's default term length the whole 50000x128B run fits inside the publication window, so offer() never waits and the run reports pub 1.61M/s against sub 48k/s with ZERO back-pressure - measuring how fast a buffer fills, not throughput. With 64k it produces 1.49M back-pressure events and a publisher rate that converges on the subscriber's.",
+      "params": { "msgs": 50000, "size": 128, "sub-work-us": 20, "term-length": "64k" }
+    }
+  ]
+}

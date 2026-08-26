@@ -1,0 +1,8 @@
+# Keeps `docker compose build` fast, especially when the Docker daemon is remote (e.g.
+# `docker context` over SSH to a real Linux host - see README.md): the whole build context
+# gets tar'd up and sent to the daemon on every build, and only tools/aeron_bench/ and
+# docker/aeron-bench/entrypoint.sh are actually needed by docker/aeron-bench/Dockerfile
+# (both COPY'd via explicit paths, unaffected by this file).
+results/
+scripts/
+*.md

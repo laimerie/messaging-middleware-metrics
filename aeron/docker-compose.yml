@@ -1,0 +1,111 @@
+# Aeron sits BETWEEN the other two projects architecturally, and this file is where that
+# shows up.
+#
+#   nats/       one central broker service. Every message goes client -> broker -> client.
+#   fast-dds/   no server process at all. Participants find each other and talk directly.
+#   aeron/      no central anything, but NOT daemonless: every host running an Aeron
+#               application also runs a MEDIA DRIVER — the process that owns the UDP
+#               sockets, the term buffers and the flow-control state. Applications reach it
+#               through memory-mapped files in AERON_DIR, and data goes driver-to-driver.
+#
+# So there is no driver SERVICE here. The driver is started inside each bench container by
+# docker/aeron-bench/entrypoint.sh, because "one driver per container" is the accurate model
+# of "one driver per host" — see that file for the full reasoning, including why sharing one
+# driver between containers through a volume was rejected.
+#
+# Two things below are load-bearing rather than cosmetic:
+#
+#   shm_size       Docker's default /dev/shm is 64MB. Aeron maps THREE term buffers per
+#                  publication there (default term length is tens of MB), plus the CnC and
+#                  loss-report files. 64MB is not enough for a single publication, and the
+#                  failure is an opaque mmap error inside the driver that never mentions
+#                  /dev/shm. entrypoint.sh warns if it sees a small one.
+#   static IPs     Aeron has NO DISCOVERY. A channel URI names a literal endpoint
+#                  (aeron:udp?endpoint=172.29.0.20:40456), so a cross-container run needs
+#                  addresses that the scripts can know in advance. Keep these in sync with
+#                  CROSS_A_ADDRESS / CROSS_B_ADDRESS in scripts/common.sh.
+services:
+  # The generic benchmark client, used for every same-container run (--mode both):
+  # bench-throughput.sh, bench-latency-oneway.sh, bench-latency.sh, bench-scalability.sh.
+  # Dynamic IP is fine here - nothing outside the container needs to address it.
+  #   docker compose run --rm aeron-bench aeron_bench --measure latency --rate 1000 --out /out
+  # cap_add NET_ADMIN: required for entrypoint.sh's `tc netem` delay injection
+  # (bench-crosshost.sh's --netem-delay-ms). Harmless/unused when that isn't set.
+  aeron-bench:
+    build:
+      context: .
+      dockerfile: docker/aeron-bench/Dockerfile
+    image: aeron-bench:local
+    profiles: ["tools"]
+    shm_size: "1gb"
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - aeronnet
+
+  # --- Cross-container roles -------------------------------------------------------------
+  #
+  # Two containers, two media drivers, real UDP between them over the bridge. This is a
+  # closer analogue of two hosts than fast-dds/'s cross-container mode was, because the
+  # driver process itself is duplicated rather than shared. It still does not reproduce a
+  # NIC or a wire - see README.md.
+  #
+  # Both roles need a KNOWN address, not just role A: for RTT the ping side subscribes to a
+  # response channel that the echo side has to publish to.
+  aeron-bench-a:
+    build:
+      context: .
+      dockerfile: docker/aeron-bench/Dockerfile
+    image: aeron-bench:local
+    profiles: ["tools"]
+    shm_size: "1gb"
+    cap_add:
+      - NET_ADMIN
+    networks:
+      aeronnet:
+        ipv4_address: 172.29.0.20
+
+  aeron-bench-b:
+    build:
+      context: .
+      dockerfile: docker/aeron-bench/Dockerfile
+    image: aeron-bench:local
+    profiles: ["tools"]
+    shm_size: "1gb"
+    cap_add:
+      - NET_ADMIN
+    networks:
+      aeronnet:
+        ipv4_address: 172.29.0.21
+
+  # --- Two-REAL-SERVER variant (profiles: host) ------------------------------------------
+  #
+  # Everything above runs on ONE Docker host, which is fine for same-host measurement but
+  # does NOT reproduce host-to-host latency (no NIC, no switch, no wire - see README.md).
+  # This one exists for running one role on each of two real servers.
+  #
+  # network_mode: host is required, not a convenience. An Aeron channel names an endpoint
+  # the peer's driver sends UDP to; on a bridge, the container's address is private to this
+  # host and the other server cannot route to it. Unlike RTPS, Aeron's ports ARE fixed and
+  # knowable, so publishing ports would in principle work for one direction - but the
+  # subscriber must BIND the address it advertises, and a bridged container cannot bind the
+  # host's address. Host networking sidesteps both halves.
+  #
+  # Invoked by scripts/bench-rtt-2host.sh; run that on each server separately.
+  aeron-bench-host:
+    build:
+      context: .
+      dockerfile: docker/aeron-bench/Dockerfile
+    image: aeron-bench:local
+    profiles: ["host"]
+    shm_size: "1gb"
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+
+networks:
+  aeronnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
