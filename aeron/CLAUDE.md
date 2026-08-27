@@ -41,6 +41,14 @@ is the thing that makes it so.
   and applications reach it through memory-mapped files. It never sits between two hosts —
   each host has its own, and data goes driver-to-driver. Do not call it a broker anywhere;
   do not call this project daemonless either.
+- **The driver's lifecycle lives in ONE file: `lib/aeron-driver.sh`.** Both
+  `docker/aeron-bench/entrypoint.sh` and `scripts/common-native.sh` source it. Do not
+  reimplement the startup sequence in either caller: the three idle strategies it sets move
+  measured p50 by 8-14x, so a second copy that drifts would silently invalidate every number
+  measured under it. It is POSIX `sh` because `entrypoint.sh` is `#!/bin/sh`. It sits at the
+  project's top level rather than under `scripts/` because `.dockerignore` excludes
+  `scripts/` from the build context and the image has to `COPY` this file — moving it under
+  `scripts/` without dealing with that breaks the image build.
 - **The driver runs inside the bench container, one per container.** Started by
   `docker/aeron-bench/entrypoint.sh`, not by a compose service. "One driver per container"
   is the accurate model of "one driver per host", and it makes `bench-crosshost.sh` a
@@ -63,6 +71,124 @@ is the thing that makes it so.
   shared knobs there, not per script. Note the split: tool flags go through
   `aeron_common_args`, but the DRIVER is configured by environment variable, so those go
   through `driver_env_args` as `docker compose run -e` arguments.
+
+- **There is a NATIVE (no-Docker) execution path, and it is not the default one.**
+  `scripts/common-native.sh` + `scripts/bench-oneway-2host.sh` run the binaries directly,
+  because the PTP-synchronised server pair cannot run Docker. Everything else in the project
+  still goes through `docker compose`. `scripts/package-native.sh` builds the tarball that
+  feeds it. Keep the native path to the minimum that needs it — `bench-rtt-2host.sh` and the
+  rest deliberately stay Docker-only rather than being ported.
+
+## Clocks — two of them, and swapping the wrong one is the trap
+
+`aeron_bench` reads two different clocks and they are not interchangeable. Getting this
+backwards produces measurements that look fine.
+
+- **`Clock` (`std::chrono::steady_clock`, `CLOCK_MONOTONIC`) measures INTERVALS** — pacing,
+  timeouts, `--linger-sec`, `--sub-work-us`, the per-second receive buckets, run duration.
+  **It must stay monotonic.** NTP and PTP can step a realtime clock backwards mid-run.
+- **`wireNowNs()` produces the timestamp that travels inside the message** and is subtracted
+  by the receiving process. That one needs to be comparable across two processes, which is a
+  different requirement, and `--clock` selects it.
+
+**Do not "simplify" this by changing `using Clock` to `system_clock`.** That is the obvious
+wrong fix: it hands every interval measurement a steppable clock while still leaving the wire
+timestamp unsynchronised wherever PTP is not actually running. The split is the point.
+
+- **PTP disciplines `CLOCK_REALTIME`, not `CLOCK_MONOTONIC`.** This is the whole reason
+  `--clock` exists. A perfectly synchronised PTP pair does nothing at all for a tool that
+  timestamps with `CLOCK_MONOTONIC`.
+- **`--clock realtime` is rejected for `--measure rtt`, and that is a correctness rule rather
+  than a restriction.** The ping side stamps and subtracts with its own clock, so RTT needs no
+  synchronisation — using a disciplined clock would only add the failure mode of a PTP step
+  landing mid-run. It is rejected for `--measure throughput` too, where it would do nothing.
+  Rejecting rather than ignoring is deliberate: a flag that silently does nothing is how a run
+  ends up labelled "PTP one-way" having measured something else.
+- **A negative latency sample is proof the two clocks are not the same clock**, and
+  `warnIfClockLooksUnsynchronised` exists because that failure is otherwise SILENT — an
+  unsynchronised pair produces a plausible distribution shifted by the offset, and only the
+  samples where the offset exceeds the true latency come out negative. Confirmed working by
+  deliberately running pub with `--clock realtime` against sub with `--clock monotonic`:
+  2000/2000 samples negative, correctly diagnosed. Do not downgrade it to a silent metric.
+- **The PTP residual offset IS the error bar**, so `bench-oneway-2host.sh` records
+  `master_offset` before and after into `meta.json`, and the error bar is bounded by the SUM
+  of the two hosts' offsets, not either one. It lives in `meta.json` rather than `result.json`
+  because it is a property of the hosts, not a metric the tool computed — consistent with
+  `save_meta` already owning reproducibility info.
+- **Hardware timestamping is close to a prerequisite, not an optimisation.** One-way latency
+  here is tens of microseconds; software-timestamped PTP carries tens of microseconds of
+  error, i.e. the error bar swallows the result. `bench-oneway-2host.sh` checks `ethtool -T`
+  and says so. When it is unavailable the right answer is `bench-rtt-2host.sh`, not a
+  caveated one-way number.
+- **The measurement lands on the SUB side** in `bench-oneway-2host.sh`, the opposite of
+  `bench-rtt-2host.sh` where the PING side measures. It follows from the definition: the
+  publisher stamps, the subscriber subtracts, so only the subscriber holds both halves.
+
+## The native (no-Docker) path — what the container was silently doing
+
+Each of these was free under `docker compose run` and is not free natively.
+
+- **An orphaned `aeronmd` busy-spins THREE cores forever.** With the default
+  `--driver-idle noop` this is not a background process idling quietly; it pins three cores at
+  100% on a real server until somebody notices. `docker compose run` tore the container down
+  for us. `native_driver_up` traps EXIT/INT/TERM for exactly this, and that trap is the single
+  most important line in `common-native.sh`. Verified: after a mid-run failure on both roles,
+  no `aeronmd` survived.
+- **`AERON_DIR_DELETE_ON_START=true` is safe in the container and NOT safe natively.**
+  `entrypoint.sh` sets it unconditionally, justified by "every run gets a fresh container, so
+  there is never a driver worth preserving" — that justification is false on a shared server,
+  where a live driver may own `AERON_DIR` right now, and deleting mmap'd files out from under
+  it corrupts silently rather than erroring. `aeron_driver_assert_free` refuses instead, and
+  detection is deliberately conservative: the CnC file existing at all is enough to stop, and
+  `fuser`/`pgrep` only make the message more specific, never decide it is safe to proceed.
+  `--force-clean` is the explicit override.
+- **`meta.json` must not claim the run was containerised.** `common.sh`'s `save_meta`
+  hardcodes `image: "aeron-bench:local"` and `"aeronmd in-container"`. `save_meta_native` is a
+  separate function rather than a flag because every field that matters differs, and a native
+  result recorded the container way is a file that lies about how it was produced.
+- **No `docker cp`, so `docker_run_and_copy_out` is unused here.** `native_run_bench` takes
+  the same shape (destination first, then the whole command) so the call sites read alike, but
+  the tool writes straight into the run directory.
+- **A blocked UDP port looks like "received 0 messages", never like a connection error**,
+  because Aeron has no discovery. `native_warn_about_firewall` says so up front.
+
+## Packaging for hosts that cannot run Docker
+
+- **Build in the image, ship the binaries — never build on the target.** Partly because gcc 11
+  and CMake 3.31 will not be installable there, but mainly for comparability: all three
+  projects' numbers were measured under the CentOS 7 / gcc 11 / C++17 client runtime, and
+  rebuilding with the target's toolchain would change the client runtime out from under the
+  comparison while looking like a packaging detail.
+- **Portability was verified, not assumed.** Measured on the image: `aeron_bench` required at
+  most `GLIBCXX_3.4.19` / `GLIBC_2.14` even before the static flags, because devtoolset-11
+  already links the newer libstdc++ pieces statically; `aeronmd` is pure C and needed no
+  libstdc++ at all. The direction here is old-build-to-new-host, which is the SAFE one — the
+  notorious `GLIBCXX_3.4.xx not found` is the opposite direction. After
+  `-static-libstdc++ -static-libgcc` the package's only floor is glibc 2.17.
+  End-to-end confirmation: unpacked on clean Ubuntu 22.04 (glibc 2.35) with no toolchain and
+  no Aeron installed, two containers ran `bench-oneway-2host.sh` pub/sub against each other,
+  5000/5000 messages, zero loss.
+- **`-static-libstdc++` is safe HERE for a specific reason.** It is dangerous when C++ objects
+  or exceptions cross a shared-library boundary, and none do: `libaeron` and
+  `libaeron_driver` are pure C (verified — neither requires a single GLIBCXX symbol) and the
+  C++ wrapper API is header-only. Do not copy the flags to a target that links a C++ `.so`.
+- **Do not ship glibc.** `BUNDLED_LIBS` is a deny-list-by-omission on purpose: libc, libm,
+  libpthread, libdl and the loader MUST come from the target host. Shipping CentOS 7's glibc
+  next to binaries on a newer kernel gets a mismatched loader and a segfault before `main()`.
+- **`package-native.sh` assembles and tars INSIDE the container**, and this is not tidiness.
+  Run from Windows, the staging directory has no POSIX permissions, `chmod +x` is a no-op, and
+  the tarball lands on the target with non-executable binaries — whose symptom is
+  `preflight.sh` reporting "aeron_bench not found" for a file that is plainly there (hit
+  during development). Doing it in Linux also lets `cp -L` dereference `libuuid.so.1`, which
+  `docker cp` would otherwise ship as a dangling symlink.
+- **`$ORIGIN/../lib` RPATH on both binaries, no `LD_LIBRARY_PATH` wrapper.** Aeron already
+  sets it on `aeronmd`; `tools/aeron_bench/CMakeLists.txt` now matches it. Keeping `bin/` and
+  `lib/` together is therefore the package's only layout requirement.
+- **Git Bash mangles more paths here than elsewhere.** `package-native.sh` needs
+  `MSYS2_ARG_CONV_EXCL` to cover `/usr`, `/lib` (which is what `/lib64` matches) and `/bin`
+  (for `--entrypoint /bin/sh`) on top of `common.sh`'s two. It still cannot be `'*'`, because
+  `docker cp`'s destination is a real path on this machine and does need converting. Every
+  omission showed up as "cannot find" a file that was plainly there.
 
 ## Aeron-specific traps this project already fell into or designed around
 

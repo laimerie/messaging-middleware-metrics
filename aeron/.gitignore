@@ -3,3 +3,7 @@ results/**/*.csv
 results/**/*.summary.txt
 results/**/meta.json
 results/**/20*/
+
+# Built by scripts/package-native.sh: a tarball of binaries for the no-Docker servers.
+# Reproducible from the image, and megabytes of ELF, so it does not belong in git.
+dist/

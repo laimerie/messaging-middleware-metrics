@@ -72,4 +72,34 @@ target_compile_definitions(aeron_bench PRIVATE
 target_link_libraries(aeron_bench PRIVATE
     ${AERON_C_LIB} Threads::Threads ${CMAKE_DL_LIBS})
 
+# --- Relocatability: this binary has to run OUTSIDE the image it was built in ------------
+#
+# scripts/package-native.sh ships bin/ + lib/ to servers that cannot run Docker (the
+# PTP-synchronised pair), so both binaries must resolve their libraries relative to
+# themselves. Aeron's own build already gives aeronmd `RPATH $ORIGIN/../lib`; without the
+# lines below, aeron_bench instead resolves libaeron.so through the image's ldconfig
+# (/etc/ld.so.conf.d/aeron.conf) and fails the moment it leaves that image. Matching Aeron's
+# choice keeps the package free of any LD_LIBRARY_PATH wrapper.
+#
+# BUILD_WITH_INSTALL_RPATH is what makes the RPATH present in the BUILD tree too, so
+# `docker cp` of the built binary behaves the same as the installed one.
+set_target_properties(aeron_bench PROPERTIES
+    INSTALL_RPATH "$ORIGIN/../lib"
+    BUILD_WITH_INSTALL_RPATH ON)
+
+# Fold the C++ runtime into the binary. Measured on the image before this was added,
+# aeron_bench required at most GLIBCXX_3.4.19 / CXXABI_1.3.2 (devtoolset-11 already links the
+# newer libstdc++ pieces statically and leaves only CentOS 7's base ABI dynamic), so it would
+# in fact run on any newer distro as-is - the well-known "GLIBCXX_3.4.xx not found" failure is
+# the OPPOSITE direction, new-build-to-old-host. These flags remove the question entirely by
+# dropping libstdc++.so.6 and libgcc_s.so.1 from the dependency list, leaving glibc 2.17 as the
+# package's only floor.
+#
+# This is safe HERE specifically, and the reason is worth keeping: static libstdc++ is
+# dangerous when C++ objects or exceptions cross a shared-library boundary, and none do -
+# libaeron and libaeron_driver are pure C (verified: neither requires a single GLIBCXX
+# symbol), and Aeron's C++ wrapper API is header-only. Do not copy these flags to a target
+# that links a C++ .so.
+target_link_options(aeron_bench PRIVATE -static-libstdc++ -static-libgcc)
+
 install(TARGETS aeron_bench RUNTIME DESTINATION bin)

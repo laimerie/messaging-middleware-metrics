@@ -111,6 +111,11 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
       -DAERON_BENCH_AERON_VERSION="${AERON_VERSION}" && \
     cmake --build build --target install -- -j$(nproc)
 
+# lib/aeron-driver.sh is the media driver's lifecycle, shared verbatim with the NATIVE
+# execution path (scripts/common-native.sh) used on servers that cannot run Docker. It is at
+# the project's top level rather than under scripts/ precisely so it stays inside the build
+# context - .dockerignore excludes scripts/.
+COPY lib/aeron-driver.sh /usr/local/lib/aeron-driver.sh
 COPY docker/aeron-bench/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
