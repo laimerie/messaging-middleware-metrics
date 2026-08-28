@@ -4,6 +4,11 @@ results/**/*.summary.txt
 results/**/meta.json
 results/**/20*/
 
+# Benchmark run artifacts; keep only the directory placeholders.
+results/**
+!results/**/
+!results/**/.gitkeep
+
 # Built by scripts/package-native.sh: a tarball of binaries for the no-Docker servers.
 # Reproducible from the image, and megabytes of ELF, so it does not belong in git.
 dist/

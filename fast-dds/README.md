@@ -277,6 +277,36 @@ Windows 等）では失敗するが、スクリプトはこれを検知して警
 差分に意味はなく、しかもエラーにならず**それらしい値や負の値が出ます**（実際に負の値が
 観測されています）。
 
+### `bench-oneway-2host-native.sh` — PTP同期済み実サーバー間の片道レイテンシ
+
+Dockerを使わず、ビルドマシンで作成したnativeパッケージを2台へ配布して測定できます。
+Fast DDSはデーモンレスで、publisherとsubscriberはUDPで直接通信します。**subscriberを先に
+起動し、publisherを後から起動してください。** publisherはDDSのpublication matchを確認して
+から送信を開始するため、subscriberのDiscovery前にサンプルを送ることはありません。
+
+```bash
+# Dockerが使えるビルドマシンで一度だけ
+./scripts/package-native.sh
+
+# 両ホストへ fast-dds/dist/fast-dds-bench-native.tar.gz をコピーし、各ホストで展開
+tar -xzf fast-dds-bench-native.tar.gz
+cd fast-dds-bench-native
+./preflight.sh
+
+# ホストBで先に起動
+./scripts/bench-oneway-2host-native.sh --role sub \
+  --target-msgs-per-sec 1000 --duration-sec 30 --clock realtime
+
+# ホストAで起動（同じtopic/rate/durationを指定）
+./scripts/bench-oneway-2host-native.sh --role pub \
+  --target-msgs-per-sec 1000 --duration-sec 30 --clock realtime
+```
+
+片道の値を使うには両ホストの`CLOCK_REALTIME`をPTPで同期してください。`--clock monotonic`は
+同一カーネル環境の確認用であり、実サーバー間では使用しないでください。SIMPLE Discoveryの
+UDPマルチキャストと、動的なRTPS UDPポートが両ホスト間で到達可能である必要があります。
+購読が`--match-timeout-sec`（既定60秒）以内に確立しない場合、publisherは送信せず終了します。
+
 ### `bench-rtt-2host.sh` — 時計同期なしで測れる往復レイテンシ
 
 RTT なら ping 側が**自分の時計だけ**で送信・受信を計測するため、同期不要です。
@@ -347,11 +377,10 @@ DS_ADDRESS=<起動したサーバーのIP> ./scripts/bench-rtt-2host.sh --role p
 4. **スイッチが PTP 対応（boundary clock / transparent clock）だと精度が上がります。**
    非対応スイッチを経由すると、キューイング遅延の非対称性が誤差として乗ります。
 
-**さらに、PTP が完璧に動いても現在の `dds_bench` では片道を測れません。**
-本ツールは `std::chrono::steady_clock`（`CLOCK_MONOTONIC`）を使っていますが、
-**PTP が規律するのは `CLOCK_REALTIME` です。** `CLOCK_MONOTONIC` は起点が任意で、
-PTP では同期されません。実サーバー間の片道測定に対応するには、ツール側を
-`CLOCK_REALTIME` ベースに切り替える改修が必要です（`TODO.md` #6）。
+`bench-oneway-2host-native.sh`は`--clock realtime`で`CLOCK_REALTIME`を使います。
+PTPが規律するのはこの時計であり、`CLOCK_MONOTONIC`ではありません。したがって、
+`--clock realtime`とPTPのシステムクロック同期を組み合わせた場合だけ、実サーバー間の
+片道値を解釈できます。
 
 ## Discovery Server（任意）
 
@@ -472,6 +501,7 @@ docker compose run --rm dds-bench dds_bench \
 | `--pub-count` / `--sub-count` | publisher / subscriber の Participant 数 |
 | `--size` | 1 メッセージのペイロードバイト数（先頭 16 バイトが seq + タイムスタンプ） |
 | `--out` | 出力ディレクトリ |
+| `--clock monotonic\|realtime` | 送受信タイムスタンプの時計（実サーバー間は`realtime`） |
 
 ### `--intraprocess` について
 

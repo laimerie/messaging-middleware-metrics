@@ -62,6 +62,17 @@ COPY tools/latency_oneway/ .
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && \
     cmake --build build --target install -- -j$(nproc)
 
+# --- Native package server -------------------------------------------------------------
+# The native two-host benchmark runs the single NATS server on the publisher host. Use
+# the official statically linked Linux binary so the package does not depend on Docker or
+# the target host's Go toolchain.
+ARG NATS_SERVER_VERSION=2.11.17
+RUN curl -fsSL -o /tmp/nats-server.tar.gz \
+      https://github.com/nats-io/nats-server/releases/download/v${NATS_SERVER_VERSION}/nats-server-v${NATS_SERVER_VERSION}-linux-amd64.tar.gz && \
+    tar -xzf /tmp/nats-server.tar.gz -C /tmp && \
+    install -m 0755 /tmp/nats-server-v${NATS_SERVER_VERSION}-linux-amd64/nats-server /usr/local/bin/nats-server && \
+    rm -rf /tmp/nats-server.tar.gz /tmp/nats-server-v${NATS_SERVER_VERSION}-linux-amd64
+
 # --- nats CLI (same version as the Windows-side install, TODO.md #1/#2/#5/#6 scripts) --
 ARG NATS_CLI_VERSION=0.4.0
 RUN curl -fsSL -o /tmp/nats-cli.zip \

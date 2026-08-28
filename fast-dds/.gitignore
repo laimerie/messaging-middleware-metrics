@@ -3,3 +3,12 @@ results/**/*.csv
 results/**/*.summary.txt
 results/**/meta.json
 results/**/20*/
+
+# Benchmark run artifacts; keep only the directory placeholders.
+results/**
+!results/**/
+!results/**/.gitkeep
+
+# Native build/package workspaces and archives are generated locally.
+workspace/
+dist/

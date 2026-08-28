@@ -22,6 +22,7 @@ NATSサーバー本体は常にDockerコンテナの中で動く（`docker-compo
 | --------------------------------------------------------------------------- | ---------------------------- | --------------------------------------------------------- |
 | `bench-throughput.sh` / `bench-scalability.sh` / `bench-latency.sh`（往復） | コンテナ内（`nats`サービス） | ホストローカルのプロセス（`nats://localhost:4222`で接続） |
 | `bench-latency-oneway.sh` / `bench-crosshost.sh`（一方向・クロスホスト）    | コンテナ内（`nats`サービス） | 別コンテナ内（`latency-tool`、`nats://nats:4222`で接続）  |
+| `bench-oneway-2host-native.sh`（実機2ホスト・一方向）                     | pubホスト上のnativeプロセス | pubホスト上のnative pub / subホスト上のnative sub       |
 
 前者はローカルにインストールした公式`nats` CLIをそのまま使うため、常に**NATSコンテナと同じマシン上**で
 実行する必要がある（`scripts/common.sh`に`NATS_SERVER_URL=nats://localhost:4222`がハードコードされて
@@ -90,6 +91,84 @@ NATSサーバー本体は常にDockerコンテナの中で動く（`docker-compo
 ./scripts/bench-crosshost.sh --tool nats-bench --label throughput-crosshost
 ./scripts/bench-crosshost.sh --netem-delay-ms 20 --label with-20ms-delay
 ```
+
+### Dockerを使えない2台で実行する
+
+`package-native.sh`は、`latency-tool`イメージ内でビルドした`latency_oneway`と、同じ版の
+静的リンクされた`nats-server`をtarballにまとめます。パッケージを両ホストへコピーするため、
+計測対象のホストではDockerやC++コンパイラは不要です。
+
+```bash
+# Dockerが使えるビルドマシンで一度だけ
+./scripts/package-native.sh
+
+# 2台へ転送して両方で展開・確認
+tar -xzf dist/nats-bench-native.tar.gz
+cd nats-bench-native
+./preflight.sh
+
+# subホストで必ず先に実行（pubホストのIPを指定して待機）
+./scripts/bench-oneway-2host-native.sh --role sub \
+  --server-url nats://<pub-host-ip>:4222 --target-msgs-per-sec 1000 --duration-sec 30
+
+# pubホストで実行。ここでnats-serverを起動し、subの購読確認後にpublisherを起動する
+./scripts/bench-oneway-2host-native.sh --role pub \
+  --server-url nats://<pub-host-ip>:4222 --target-msgs-per-sec 1000 --duration-sec 30
+```
+
+For the two-host Core/Leaf fan-out matrix, use `bench-leaf-2host-native.sh`. Run the `sub`
+role on the subscriber host first and the `pub` role on the publisher host second. In `leaf`
+mode the script creates one native NATS process per Leaf, assigns subscribers round-robin, waits
+for every subscription to be visible, and stores one result per subscriber plus an aggregate.
+`direct` mode connects all subscribers to the Core. The host-wide CPU monitor records
+one sample per interval in `cpu-samples.jsonl`, summarizes the samples in `cpu.json`, and records
+`cpu-abort.json` if the limit is exceeded. It terminates only the processes started by the current
+run after the configured number of consecutive samples over the limit. `cpu.json` contains the
+sample count and host CPU `min`, `p50`, `p95`, `max`, and `average` percentages. The same interval
+also records CPU usage for each started process in `process-cpu-samples.jsonl` and summarizes it in
+`process-cpu.json`: Core NATS, each Leaf NATS, the Publisher, and each Subscriber are identified by
+`label` and `category`. `cpu_percent_host` is normalized to the whole host capacity (the same
+0--100 percent scale as `cpu.json`), while `cpu_percent_single_core` is normalized to one CPU core.
+The same measurement interval also records `system-samples.jsonl` and `io.json` for aggregate
+`iowait`, `tcp-queue-samples.jsonl` for `ss` socket states and `Recv-Q`/`Send-Q`,
+`netdev-samples.jsonl` for `/proc/net/dev` RX/TX counters and per-interval deltas, and `network.json`
+for total deltas, peak bytes/s and packets/s, and peak drop/error deltas per interface.
+`tcp-queue.json` summarizes the maximum `Recv-Q`/`Send-Q` and socket states from
+`tcp-queue-samples.jsonl`. `nats-samples.jsonl` stores the Core/Leaf `/varz` and
+`/connz?subs=1` snapshots, while `nats-queue.json` summarizes maximum pending bytes/messages and
+traffic counters per server. These files are diagnostic evidence; the benchmark result remains the
+latency and delivery result in `result.json`.
+
+```bash
+# SUB host (start first; use the PUB host address)
+./scripts/bench-leaf-2host-native.sh --role sub --mode leaf --pub-host <pub-host-ip> \
+  --leaf-count 5 --subscriber-count 100 --rate 1000 --duration-sec 30 --size 500 \
+  --clock realtime --label leaf5-100sub
+
+# PUB host (start after the SUB command is waiting)
+./scripts/bench-leaf-2host-native.sh --role pub --mode leaf --pub-host <pub-host-ip> \
+  --leaf-count 5 --subscriber-count 100 --rate 1000 --duration-sec 30 --size 500 \
+  --clock realtime --label leaf5-100sub
+```
+
+Use `--mode direct --leaf-count 0` for the baseline. For convenience, `--mode leaf --leaf-count 0`
+is treated identically as Direct mode. The default CPU limit is 80 percent,
+sampled once per second for three consecutive samples; override it with `--cpu-limit`,
+`--cpu-interval-sec`, and `--cpu-consecutive`. The script checks all local NATS ports before
+starting; if a previous run or another service is using one, stop it or pass the same
+`--port-offset N` to both host commands. This adds `N` to every benchmark port and allows
+separate runs to use different port ranges. Keep `--subject` unique for concurrent runs.
+
+`--clock realtime`がデフォルトです。片道レイテンシを正しく比較するには、両ホストの
+`CLOCK_REALTIME`をPTP等で同期してください。時計同期を使わない同一ホスト相当の確認では
+`--clock monotonic`を指定できますが、別ホストの片道値には使わないでください。pubホストの
+TCP `4222`とmonitoring APIの`8222`（`--port-offset`を使う場合は、それぞれオフセット後のポート）を、
+subホストとpub側スクリプトから到達可能にしてください。
+pub側は`/varz`でserver起動を確認した後、`/connz?subs=1`に指定subjectの購読が現れるまで
+publisherを起動しません。購読確認は既定120秒でタイムアウトし、その場合はpublisherを実行せず
+エラー終了します。必要に応じて`--subscription-timeout-sec`と
+`--subscription-poll-interval-sec`で待機時間と確認間隔を調整できます。複数の計測を同じserverで
+同時実行する場合は、既存購読による誤readyを避けるため、各実行で異なる`--subject`を指定してください。
 
 `--netem-delay-ms` は、実際のホスト間レイテンシを模擬するために人工的なネットワーク遅延
 （`tc netem`）を注入しようとするオプション。同一Dockerホスト上のコンテナ同士は通常ほぼゼロ

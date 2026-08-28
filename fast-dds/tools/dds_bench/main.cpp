@@ -95,6 +95,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <ctime>
 #include <thread>
 #include <vector>
 
@@ -132,6 +133,12 @@ constexpr auto kPacingSpinGuard = std::chrono::microseconds(200);
 int64_t nowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
         .count();
+}
+
+int64_t realtimeNs() {
+    timespec ts{};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
 
 [[noreturn]] void fail(const std::string& what) {
@@ -209,6 +216,7 @@ struct Options {
     //           any rate, and only pays the full core cost when the interval is too short
     //           to sleep through at all (roughly above 5000 msgs/sec).
     std::string pacing = "auto";  // auto | sleep | busy
+    std::string clock = "monotonic";  // monotonic | realtime
 
     // Simulated per-sample application work on the subscriber side. 0 = consume as fast as
     // possible. Exists to quantify how much application-side processing a given send rate
@@ -340,8 +348,8 @@ private:
 class ReaderListener : public DataReaderListener {
 public:
     ReaderListener(uint32_t payloadSize, bool keepSamples, MatchCounter* matches,
-                   uint64_t expectedSamples, int workUs)
-        : keepSamples_(keepSamples), matches_(matches), workUs_(workUs) {
+                   uint64_t expectedSamples, int workUs, const std::string& clock)
+        : keepSamples_(keepSamples), matches_(matches), workUs_(workUs), clock_(clock) {
         scratch_.bytes.resize(payloadSize);
         // Reserve up front. Fast DDS calls on_data_available on its RECEPTION thread, so
         // anything slow in here stops the transport being drained — and a vector growing
@@ -360,7 +368,7 @@ public:
         SampleInfo info;
         while (reader->take_next_sample(&scratch_, &info) == ReturnCode_t::RETCODE_OK) {
             if (!info.valid_data) continue;
-            const int64_t recvNs = nowNs();
+            const int64_t recvNs = clock_ == "realtime" ? realtimeNs() : nowNs();
 
             if (count_ == 0) firstNs_ = recvNs;
             lastNs_ = recvNs;
@@ -411,6 +419,7 @@ private:
     bool keepSamples_;
     MatchCounter* matches_;
     int workUs_ = 0;
+    std::string clock_;
     uint64_t count_ = 0;
     uint64_t bytes_ = 0;
     int64_t firstNs_ = 0;
@@ -608,7 +617,7 @@ void createReaders(Endpoints& ep, const Options& opt, const std::vector<Topic*>&
     for (Topic* topic : topics) {
         ep.readerListeners.push_back(std::make_unique<ReaderListener>(
             static_cast<uint32_t>(opt.size), keepSamples, matches, expectedPerReader,
-            opt.subWorkUs));
+            opt.subWorkUs, opt.clock));
         DataReader* reader =
             ep.subscriber->create_datareader(topic, rqos, ep.readerListeners.back().get());
         if (reader == nullptr) fail("failed to create DataReader on '" + topic->get_name() + "'");
@@ -739,7 +748,7 @@ PubResult publishAll(const std::vector<Endpoints*>& groups, const Options& opt, 
             for (uint64_t i = 0; i < share; ++i) {
                 const auto sendStart = Clock::now();
                 const uint64_t seq = nextSeq.fetch_add(1);
-                const int64_t ts = nowNs();
+                const int64_t ts = opt.clock == "realtime" ? realtimeNs() : nowNs();
                 std::memcpy(sample.bytes.data(), &seq, sizeof(seq));
                 std::memcpy(sample.bytes.data() + sizeof(seq), &ts, sizeof(ts));
                 ep->writers[i % ep->writers.size()]->write(&sample);
@@ -939,6 +948,8 @@ std::string paramsJson(const Options& opt, uint64_t totalMsgs) {
       << "    \"sub_work_us\": " << opt.subWorkUs << ",\n"
       << "    \"nack_response_delay_us\": " << opt.nackResponseDelayUs << ",\n"
       << "    \"heartbeat_response_delay_us\": " << opt.heartbeatResponseDelayUs;
+    j << ",\n"
+      << "    \"clock\": \"" << opt.clock << "\"";
     return j.str();
 }
 
@@ -1052,6 +1063,7 @@ Options parseArgs(int argc, char** argv) {
         else if (arg == "--nack-response-delay-us") opt.nackResponseDelayUs = std::stoi(next("--nack-response-delay-us"));
         else if (arg == "--heartbeat-response-delay-us") opt.heartbeatResponseDelayUs = std::stoi(next("--heartbeat-response-delay-us"));
         else if (arg == "--pacing") opt.pacing = next("--pacing");
+        else if (arg == "--clock") opt.clock = next("--clock");
         else if (arg == "--sub-work-us") opt.subWorkUs = std::stoi(next("--sub-work-us"));
         else if (arg == "--out") opt.out = next("--out");
         else if (arg == "--match-timeout-sec") opt.matchTimeoutSec = std::stoi(next("--match-timeout-sec"));
@@ -1108,6 +1120,9 @@ Options parseArgs(int argc, char** argv) {
     }
     if (opt.intraprocess != "on" && opt.intraprocess != "off") {
         fail("--intraprocess must be 'on' or 'off' (got '" + opt.intraprocess + "')");
+    }
+    if (opt.clock != "monotonic" && opt.clock != "realtime") {
+        fail("--clock must be 'monotonic' or 'realtime' (got '" + opt.clock + "')");
     }
 
     if (opt.timeoutSec < 0) {

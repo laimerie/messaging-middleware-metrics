@@ -1,3 +1,12 @@
 # Claude Code's own session-local files - not part of the project.
 .claude/
 tibrv/
+
+# JetBrains user-local project state and Junie session artifacts.
+.idea/workspace.xml
+.idea/editor.xml
+.junie/
+
+# Native build/package workspaces generated inside middleware projects.
+**/workspace/
+**/dist/

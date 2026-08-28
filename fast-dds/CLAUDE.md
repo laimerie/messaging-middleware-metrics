@@ -83,9 +83,9 @@ That is what makes them worth writing down.
   (negative values were actually observed on real hardware). Same-host containers are fine
   because they share one kernel clock. `scripts/bench-rtt-2host.sh` sidesteps this by
   measuring round-trip with the ping side's own clock only. A true cross-host one-way
-  figure needs PTP **and** a tool change: PTP disciplines `CLOCK_REALTIME`, not
-  `CLOCK_MONOTONIC`, so the current tool would not benefit even from perfect PTP sync
-  (TODO.md #6).
+  figure needs PTP and `dds_bench --clock realtime`: PTP disciplines `CLOCK_REALTIME`, not
+  `CLOCK_MONOTONIC`. The native two-host script defaults to that mode; `monotonic` remains
+  appropriate only when both processes share a kernel clock.
 - **Cross-server runs require `network_mode: host`** (compose services `dds-bench-host` /
   `discovery-server-host`). RTPS advertises LOCATORS — literal IPs the peer is told to send
   to — so on a bridge a container advertises its private address (confirmed: 172.28.0.2)

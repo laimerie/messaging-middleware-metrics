@@ -41,6 +41,7 @@ struct Options {
     uint64_t msgs = 0;         // computed: round(rate * durationSec)
     int timeoutSec = -1;       // how long sub/both wait for the expected message count; -1 = derive from durationSec
     std::string pacing = "auto"; // pacing strategy: auto | busy | sleep
+    std::string clock = "monotonic"; // timestamp clock: monotonic | realtime
 };
 
 struct Sample {
@@ -63,8 +64,18 @@ int64_t nowNs() {
         .count();
 }
 
-void onMsg(natsConnection*, natsSubscription*, natsMsg* msg, void*) {
-    const int64_t recvNs = nowNs();
+int64_t timestampNs(const Options& opt) {
+    if (opt.clock == "realtime") {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    }
+    return nowNs();
+}
+
+void onMsg(natsConnection*, natsSubscription*, natsMsg* msg, void* closure) {
+    const auto* opt = static_cast<const Options*>(closure);
+    const int64_t recvNs = timestampNs(*opt);
     const char* data = natsMsg_GetData(msg);
     const int dataLen = natsMsg_GetDataLength(msg);
 
@@ -174,6 +185,7 @@ Options parseArgs(int argc, char** argv) {
                 fail("--pacing must be one of: auto, busy, sleep (got '" + opt.pacing + "')");
             }
         }
+        else if (arg == "--clock") opt.clock = next("--clock");
         else {
             fail("unknown argument: " + arg + " (note: --msgs was removed - use --rate and --duration-sec instead; "
                  "total message count is derived from rate * duration)");
@@ -181,6 +193,9 @@ Options parseArgs(int argc, char** argv) {
     }
     if (opt.mode != "both" && opt.mode != "pub" && opt.mode != "sub") {
         fail("--mode must be one of: both, pub, sub (got '" + opt.mode + "')");
+    }
+    if (opt.clock != "monotonic" && opt.clock != "realtime") {
+        fail("--clock must be one of: monotonic, realtime (got '" + opt.clock + "')");
     }
     if (opt.size < static_cast<int>(sizeof(LatencyHeader))) {
         fail("--size must be >= " + std::to_string(sizeof(LatencyHeader)) + " bytes (needs room for the seq+timestamp header)");
@@ -269,7 +284,8 @@ void writeLatencyResult(const Options& opt, uint64_t sent, uint64_t received) {
          << "    \"duration_sec\": " << opt.durationSec << ",\n"
          << "    \"msgs\": " << opt.msgs << ",\n"
          << "    \"size\": " << opt.size << ",\n"
-         << "    \"pacing\": \"" << opt.pacing << "\"\n"
+         << "    \"pacing\": \"" << opt.pacing << "\",\n"
+         << "    \"clock\": \"" << opt.clock << "\"\n"
          << "  },\n"
          << "  \"environment\": {\n"
          << "    \"latency_tool_version\": \"latency_oneway 0.3.0_pacing\",\n"
@@ -309,7 +325,8 @@ void writePubOnlyResult(const Options& opt, uint64_t sent) {
          << "    \"duration_sec\": " << opt.durationSec << ",\n"
          << "    \"msgs\": " << opt.msgs << ",\n"
          << "    \"size\": " << opt.size << ",\n"
-         << "    \"pacing\": \"" << opt.pacing << "\"\n"
+         << "    \"pacing\": \"" << opt.pacing << "\",\n"
+         << "    \"clock\": \"" << opt.clock << "\"\n"
          << "  },\n"
          << "  \"environment\": {\n"
          << "    \"latency_tool_version\": \"latency_oneway 0.3.0_pacing\",\n"
@@ -333,7 +350,7 @@ void runPublisher(natsConnection* pubConn, const Options& opt) {
 
         LatencyHeader* hdr = reinterpret_cast<LatencyHeader*>(payload.data());
         hdr->seq = i;
-        hdr->send_time_ns = nowNs();
+        hdr->send_time_ns = timestampNs(opt);
 
         natsStatus s = natsConnection_Publish(pubConn, opt.subject.c_str(), payload.data(), opt.size);
         if (s != NATS_OK) {
@@ -366,7 +383,7 @@ int runBoth(const Options& opt) {
     check(natsConnection_ConnectTo(&subConn, opt.server.c_str()), "connect (subscriber)");
     connectPublisher(&pubConn, opt.server);
 
-    check(natsConnection_Subscribe(&sub, subConn, opt.subject.c_str(), onMsg, nullptr), "subscribe");
+    check(natsConnection_Subscribe(&sub, subConn, opt.subject.c_str(), onMsg, const_cast<Options*>(&opt)), "subscribe");
 
     std::thread pubThread(runPublisher, pubConn, opt);
     pubThread.join();
@@ -387,7 +404,7 @@ int runSubOnly(const Options& opt) {
     natsSubscription* sub = nullptr;
 
     check(natsConnection_ConnectTo(&subConn, opt.server.c_str()), "connect (subscriber-only)");
-    check(natsConnection_Subscribe(&sub, subConn, opt.subject.c_str(), onMsg, nullptr), "subscribe");
+    check(natsConnection_Subscribe(&sub, subConn, opt.subject.c_str(), onMsg, const_cast<Options*>(&opt)), "subscribe");
 
     std::cout << "Subscriber listening. Waiting for " << opt.msgs << " messages..." << std::endl;
     waitForReceipt(opt.msgs, opt.timeoutSec);

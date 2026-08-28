@@ -25,6 +25,7 @@ services:
   # cap_add NET_ADMIN: required for entrypoint.sh's `tc netem` delay injection
   # (bench-crosshost.ps1's -NetemDelayMs). Harmless/unused when that's not set.
   latency-tool:
+    image: nats-latency-tool:local
     build:
       context: .
       dockerfile: docker/latency-tool/Dockerfile
