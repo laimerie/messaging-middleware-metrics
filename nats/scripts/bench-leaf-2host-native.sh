@@ -430,22 +430,10 @@ save_process_cpu_metrics() {
         "$PROCESS_CPU_SAMPLES" > "$RUN/process-cpu.json"
 }
 
-save_cpu_metrics() {
-    if [[ ! -s "$CPU_SAMPLES" ]]; then
-        jq -n --arg host "$(hostname)" --arg interval "$CPU_INTERVAL" \
-            '{host:$host,sample_interval_sec:($interval|tonumber),sample_count:0}' > "$RUN/cpu.json"
-        return
-    fi
-    jq -s --arg host "$(hostname)" --arg interval "$CPU_INTERVAL" \
-        'map(.cpu_percent) as $values |
-         ($values | sort) as $sorted |
-         ($sorted | length) as $count |
-         {host:$host,sample_interval_sec:($interval|tonumber),sample_count:$count,
-          cpu_percent:{min:($sorted[0]),p50:($sorted[((($count-1)*0.50)|floor)]),
-                       p95:($sorted[((($count-1)*0.95)|floor)]),max:($sorted[-1]),
-                       average:($values|add/length)}}' \
-        "$CPU_SAMPLES" > "$RUN/cpu.json"
-}
+# There is deliberately no cpu.json: summarize-leaf-run.sh reads cpu-samples.jsonl directly
+# because it needs p90/p99, and everything the old summary held is either in summary.json or
+# recomputable from the samples. The sampling interval it used to carry now lives in
+# meta.json, where the rest of the run parameters are.
 
 # The Core accepts the Leaf connections coming in from the SUB host.
 write_core_config() {
@@ -639,8 +627,9 @@ save_meta_native() {
         --argjson leaf "$LEAF_COUNT" --argjson subServers "$SUB_SERVER_COUNT" \
         --argjson subs "$SUBSCRIBER_COUNT" --argjson rate "$RATE" \
         --argjson duration "$DURATION" --argjson size "$SIZE" --argjson cpuLimit "$CPU_LIMIT" \
+        --argjson cpuInterval "$CPU_INTERVAL" --argjson cpuConsecutive "$CPU_CONSECUTIVE" \
         --argjson portOffset "$PORT_OFFSET" --argjson nic "$(nic_speeds_json)" \
-        '{"timestamp":$ts,"role":$role,"mode":$mode,"host":$host,"pub_host":$pub,"sub_host":$sub,"subject":$subject,"clock":$clock,"pacing":$pacing,"label":$run_label,"leaf_count":$leaf,"leaf_placement":(if $mode == "direct" then "none" else "sub_host" end),"sub_server_count":$subServers,"subscriber_count":$subs,"target_msgs_per_sec":$rate,"duration_sec":$duration,"size":$size,"cpu_limit_percent":$cpuLimit,"port_offset":$portOffset,"topology":$topology,"subscriber_assignment":$assignment,"nic_speed_mbps":$nic,"image":"none"}' \
+        '{"timestamp":$ts,"role":$role,"mode":$mode,"host":$host,"pub_host":$pub,"sub_host":$sub,"subject":$subject,"clock":$clock,"pacing":$pacing,"label":$run_label,"leaf_count":$leaf,"leaf_placement":(if $mode == "direct" then "none" else "sub_host" end),"sub_server_count":$subServers,"subscriber_count":$subs,"target_msgs_per_sec":$rate,"duration_sec":$duration,"size":$size,"cpu_limit_percent":$cpuLimit,"cpu_interval_sec":$cpuInterval,"cpu_consecutive":$cpuConsecutive,"port_offset":$portOffset,"topology":$topology,"subscriber_assignment":$assignment,"nic_speed_mbps":$nic,"image":"none"}' \
         > "$RUN/meta.json"
 }
 
@@ -672,7 +661,6 @@ if [[ "$ROLE" == pub ]]; then
         sleep 0.1
     done
     kill "$monitor_pid" 2>/dev/null || true
-    save_cpu_metrics
     save_io_metrics
     save_tcp_queue_metrics
     save_nats_queue_metrics
@@ -698,7 +686,6 @@ if [[ "$ROLE" == pub ]]; then
     monitor_cpu & monitor_pid=$!
     wait "$publisher_pid" || true
     kill "$monitor_pid" 2>/dev/null || true
-    save_cpu_metrics
     save_process_cpu_metrics
     save_io_metrics
     save_tcp_queue_metrics
@@ -748,20 +735,29 @@ else
             done
         fi
     fi
-    echo "Starting $SUBSCRIBER_COUNT subscriber(s). Topology: $(topology_description)"
+    # Resolve every subscriber's target first and record the whole assignment map in one
+    # subscribers.json, rather than one small meta.json per subscriber directory. It is
+    # written before anything launches, so the map survives a failed start.
+    declare -a SUBSCRIBER_URL=()
+    subscriber_rows=()
     for ((i=0; i<SUBSCRIBER_COUNT; i++)); do
         if [[ "$MODE" == direct ]]; then
-            server="nats://$PUB_HOST:$CORE_CLIENT_PORT"
+            SUBSCRIBER_URL[i]="nats://$PUB_HOST:$CORE_CLIENT_PORT"
         else
-            server="nats://127.0.0.1:$(subscriber_server_port "$i")"
+            SUBSCRIBER_URL[i]="nats://127.0.0.1:$(subscriber_server_port "$i")"
         fi
-        assignment="$(subscriber_assignment "$i")"
+        subscriber_rows+=("$i"$'\t'"${SUBSCRIBER_URL[i]}"$'\t'"$(subscriber_assignment "$i")")
+    done
+    printf '%s\n' "${subscriber_rows[@]}" | jq -Rn \
+        '[inputs | split("\t") | {subscriber_id:(.[0]|tonumber), server:.[1], assignment:.[2]}]' \
+        > "$RUN/subscribers.json"
+
+    echo "Starting $SUBSCRIBER_COUNT subscriber(s). Topology: $(topology_description)"
+    for ((i=0; i<SUBSCRIBER_COUNT; i++)); do
         out="$RUN/subscriber-$i"
         mkdir -p "$out"
-        jq -n --arg role subscriber --argjson id "$i" --arg server "$server" --arg assignment "$assignment" \
-            '{role:$role,subscriber_id:$id,server:$server,assignment:$assignment}' > "$out/meta.json"
         "$TOOL" --mode sub --subject "$SUBJECT" --rate "$RATE" --duration-sec "$DURATION" --size "$SIZE" \
-            --server "$server" --clock "$CLOCK" --pacing "$PACING" --out "$out" >"$out/stdout.log" 2>&1 & register_app_process "$!" "subscriber-$i" application
+            --server "${SUBSCRIBER_URL[i]}" --clock "$CLOCK" --pacing "$PACING" --out "$out" >"$out/stdout.log" 2>&1 & register_app_process "$!" "subscriber-$i" application
     done
     monitor_cpu & monitor_pid=$!
     status=0
@@ -769,7 +765,6 @@ else
     # EXIT trap, so waiting on them here would hang the run.
     for pid in "${APP_PIDS[@]}"; do wait "$pid" || status=1; done
     kill "$monitor_pid" 2>/dev/null || true
-    save_cpu_metrics
     save_process_cpu_metrics
     save_io_metrics
     save_tcp_queue_metrics

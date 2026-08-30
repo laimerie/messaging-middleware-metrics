@@ -147,16 +147,19 @@ subscribers actually attached to, and cross-checks that the Core has accepted al
 connections before it starts publishing. `direct` mode connects every subscriber straight
 to the Core on the PUB host and needs no `--sub-host`.
 
-The script stores one result per subscriber plus an aggregate. The host-wide CPU monitor records
-one sample per interval in `cpu-samples.jsonl`, summarizes the samples in `cpu.json`, and records
-`cpu-abort.json` if the limit is exceeded. It terminates only the processes started by the current
-run after the configured number of consecutive samples over the limit. `cpu.json` contains the
-sample count and host CPU `min`, `p50`, `p95`, `max`, and `average` percentages. The same interval
+The script stores one result per subscriber plus an aggregate, and records which server each
+subscriber attached to in a single `subscribers.json` at the run root. The host-wide CPU monitor
+records one sample per interval in `cpu-samples.jsonl` and writes `cpu-abort.json` if the limit is
+exceeded, terminating only the processes started by the current run after the configured number of
+consecutive samples over the limit. There is no derived `cpu.json`: `summarize-leaf-run.sh` reads
+the samples directly because it reports `p90`/`p99`, and the sampling interval is recorded in
+`meta.json` as `cpu_interval_sec`. The same interval
 also records CPU usage for each started process in `process-cpu-samples.jsonl` and summarizes it in
 `process-cpu.json`: the Core NATS and Publisher on the PUB host, and each Leaf NATS, each
 sub-side NATS, and each Subscriber on the SUB host, are identified by `label` and `category`
-(`nats` or `application`), so the per-tier CPU cost can be read off directly. `cpu_percent_host` is normalized to the whole host capacity (the same
-0--100 percent scale as `cpu.json`), while `cpu_percent_single_core` is normalized to one CPU core.
+(`nats` or `application`), so the per-tier CPU cost can be read off directly. `cpu_percent_host` is
+normalized to the whole host capacity (the same 0--100 percent scale the summary reports for the
+host), while `cpu_percent_single_core` is normalized to one CPU core.
 The same measurement interval also records `system-samples.jsonl` and `io.json` for aggregate
 `iowait`, `tcp-queue-samples.jsonl` for `ss` socket states and `Recv-Q`/`Send-Q`,
 `netdev-samples.jsonl` for `/proc/net/dev` RX/TX counters and per-interval deltas, and `network.json`
@@ -211,7 +214,7 @@ must be reachable from the PUB host for the readiness gate.
 ### 1回の実行を1行にまとめる
 
 Each role writes its own result directory, so one run with 100 subscribers spreads its
-numbers over roughly 460 files. `summarize-leaf-run.sh` reads both halves and writes one
+numbers over roughly 360 files. `summarize-leaf-run.sh` reads both halves and writes one
 `summary.json` plus one row in `results/crosshost/leaf-summary.csv`:
 
 ```bash

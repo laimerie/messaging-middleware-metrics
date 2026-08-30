@@ -70,6 +70,14 @@ overall structure); everything in this file is scoped to `nats/` only. See `READ
   `meta.json` に `nic_speed_mbps`（`/sys/class/net/<if>/speed`、仮想・down は -1）を記録し、
   サマリ側で利用率%に換算している。物理NICとloopbackは分けて見る — SUBホストでは段内fan-outが
   全てloopbackを通るので、`lo` を混ぜるとホスト間トラフィックの評価を誤る。
+- **`cpu.json` は意図的に書いていない。** `summarize-leaf-run.sh` は p90/p99 を出すため
+  `cpu-samples.jsonl` を直接読む。派生ファイル側は p95 しか持っておらず噛み合わなかったため、
+  誰も読まない中間ファイルになっていた。復活させるなら summarizer 側も揃えること。
+  サンプリング間隔は `meta.json` の `cpu_interval_sec`（`cpu_consecutive` も同様）にある —
+  以前は `cpu.json` にしか無く、実行パラメータの記録漏れだった。
+- **Subscriber の割り当ては run 直下の `subscribers.json` 1つにまとめる。**
+  `subscriber-<i>/meta.json` を N 個作ると、N=100 の実行で小ファイルが 100 個増えるだけで
+  内容は 1 つの配列に収まる。起動前に書くので、途中で起動に失敗しても割り当て表は残る。
 - **サマリのレイテンシは既定では「分位点の分位点」で近似値。** 各subscriberの p99 を集めて
   中央値と最大を出している。厳密な全体分位点が要る場合は `--pool-latency`
   （`subscriber-*/latency.csv` を全件プール）。実測で両者は数%ずれる。

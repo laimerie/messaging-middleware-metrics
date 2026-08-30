@@ -2,7 +2,7 @@
 # summarize-leaf-run.sh - collapse one two-host Leaf/Direct run into a single summary.
 #
 # bench-leaf-2host-native.sh writes one result directory per host, and with 100 subscribers
-# a single run spreads its numbers over roughly 460 files. This reads both halves and emits
+# a single run spreads its numbers over roughly 360 files. This reads both halves and emits
 # one summary.json plus one row in results/crosshost/leaf-summary.csv, so runs can be
 # compared without opening any of them.
 set -euo pipefail
