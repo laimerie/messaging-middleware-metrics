@@ -3,8 +3,7 @@
 tibrv/
 
 # JetBrains user-local project state and Junie session artifacts.
-.idea/workspace.xml
-.idea/editor.xml
+.idea/
 .junie/
 
 # Native build/package workspaces generated inside middleware projects.
