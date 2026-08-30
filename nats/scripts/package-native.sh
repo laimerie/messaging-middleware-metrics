@@ -26,6 +26,7 @@ mkdir -p "$stage/scripts"
 cp "$PROJECT_ROOT/scripts/common.sh" "$stage/scripts/"
 cp "$PROJECT_ROOT/scripts/bench-oneway-2host-native.sh" "$stage/scripts/"
 cp "$PROJECT_ROOT/scripts/bench-leaf-2host-native.sh" "$stage/scripts/"
+cp "$PROJECT_ROOT/scripts/summarize-leaf-run.sh" "$stage/scripts/"
 
 cat > "$stage/preflight.sh" <<'PREFLIGHT'
 #!/usr/bin/env bash

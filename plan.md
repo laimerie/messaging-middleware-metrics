@@ -28,26 +28,34 @@ Total: 2 hosts、100 SUB（SubscriberはSUBホストに集約）
 ```
 
 これをNATS Leaf Nodeを使って階層化し、PUBホストのCore NATSから100個のSubscriberへ
-直接配信する構成と、Core NATSから例えば5個のLeaf Nodeへ配信し、Leaf NodeがSUBホスト上の
-Subscriberへfan-outする構成を比較する。Subscriber-side NATSや100台のSubscriber hostは
-今回の測定では使用しない。
+直接配信する構成（Direct）と、階層化した構成（Leaf）を比較する。
 
-想定構成：
+**Leaf NodeはSUBホスト側に配置する。** 当初はLeafをPUBホスト上に置く構成で設計していたが、
+その配置ではSubscriber 100個分のTCP接続が結局PUBホストのNICを通るため、ホスト間を渡る
+コピー数はDirect構成と変わらず（Nのまま）、PUB側NICが飽和して測定そのものが成立しなかった。
+LeafをSUBホストへ移すと、ホスト間を渡る接続数がN（Subscriber数）からL（Leaf数）に落ちる。
+これがLeaf階層化の目的である。
+
+さらにLeafの下にもう一段、SUB側のNATS Server層（subserver）を置けるようにし、
+Leaf数Lとsubserver数Sをそれぞれ独立に変えられるようにする。S=0のときはLeafに直結する。
+
+想定構成（L=5, S=10, N=100の例）：
 
 ```text
-                         PUBホスト
-                    Publisher / Core NATS
-                       │    │    │
-                    Leaf-1 ... Leaf-5
-                       │    │    │
-                 ──────┴────┴────┴────── TCP ──────
-                                      │
-                                  SUBホスト
-                              Subscriber ×100
+      PUBホスト                          SUBホスト
+   Publisher / Core NATS
+            │                        Leaf-1 ‥ Leaf-5          （remote → PUB:7422）
+            └──── TCP × L ──────────────┘  │
+                                           │
+                                 subserver-1 ‥ subserver-10   （remote → leaf j mod L）
+                                           │
+                                    Subscriber ×100           （→ subserver i mod S）
 
 Total:
-5 Leaf（PUBホスト上）
+5 Leaf（SUBホスト上）
+10 subserver（SUBホスト上）
 100 Subscriber（SUBホスト上）
+ホスト間を渡るTCP接続: 5本（Direct構成では100本）
 ```
 
 ## 2. 検証したい仮説
@@ -74,14 +82,21 @@ PUBホストのCore NATS → 100 Subscriber（SUBホスト）
 Leaf構成：
 
 ```text
-PUBホストのCore NATS → 5 Leaf（同じPUBホスト）
+PUBホストのCore NATS → 5 Leaf（SUBホスト）
+                         ↓
+                    10 subserver（SUBホスト）
                          ↓
                     100 Subscriber（SUBホスト）
 ```
 
 Core NATSが100個のSubscriber接続を直接処理する代わりに、5個のLeaf接続へ集約することで、
-Core NATSの処理負荷・queueingを減らせるか確認する。LeafはPUBホスト上のNATS Serverとして
-起動し、SubscriberはLeafのclient portへSUBホストから接続する。
+Core NATSの処理負荷・queueingを減らせるか確認する。LeafはSUBホスト上のNATS Serverとして
+起動しPUBホストのleafnodes portへdialするので、**ホスト間を渡るのはLeaf接続のL本だけ**に
+なる。ここがPUBホスト側にLeafを置く案との決定的な違いで、PUB側に置いた場合はSubscriber
+接続がそのままNICを通るためこの効果が一切得られない。
+
+fan-outの段数そのものの寄与（Leaf 1段 vs Leaf＋subserver 2段）は、`--sub-server-count 0`
+との比較で切り分ける。
 
 ### 仮説3：CPU使用率はレイテンシ結果を説明する
 

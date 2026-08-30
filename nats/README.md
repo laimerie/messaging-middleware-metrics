@@ -117,47 +117,129 @@ cd nats-bench-native
 ```
 
 For the two-host Core/Leaf fan-out matrix, use `bench-leaf-2host-native.sh`. Run the `sub`
-role on the subscriber host first and the `pub` role on the publisher host second. In `leaf`
-mode the script creates one native NATS process per Leaf, assigns subscribers round-robin, waits
-for every subscription to be visible, and stores one result per subscriber plus an aggregate.
-`direct` mode connects all subscribers to the Core. The host-wide CPU monitor records
+role on the subscriber host first and the `pub` role on the publisher host second.
+
+In `leaf` mode the Leaf tier and the sub-side server tier both run on the **subscriber**
+host, so the only traffic crossing the wire is the Core→Leaf links:
+
+```text
+PUB host                     SUB host
+publisher                    leaf-0 .. leaf-(L-1)             remote → PUB core leaf port
+    │                            │
+core-nats  === L TCP links ==----┘
+                                 │
+                             subserver-0 .. subserver-(S-1)   remote → leaf-(j mod L)
+                                 │
+                             subscriber-0 .. subscriber-(N-1) → subserver-(i mod S)
+```
+
+`--leaf-count L` and `--sub-server-count S` size the two tiers independently; with `S = 0`
+the subscribers attach straight to the Leaf tier. Both tiers are assigned round-robin:
+subserver `j` dials leaf `j mod L`, and subscriber `i` attaches to subserver `i mod S`.
+Because only `L` links cross between the hosts instead of one per subscriber, the
+publisher NIC no longer carries `N` copies of the stream — that saturation is what made
+the earlier pub-side Leaf placement unusable at 100 subscribers, since a Leaf sitting on
+the publisher host does not reduce the number of cross-host connections at all.
+
+Since the Leaf tier now lives on the subscriber host, the `pub` role requires `--sub-host`
+in `leaf` mode: it confirms readiness by counting subscriptions on the tier the
+subscribers actually attached to, and cross-checks that the Core has accepted all `L` leaf
+connections before it starts publishing. `direct` mode connects every subscriber straight
+to the Core on the PUB host and needs no `--sub-host`.
+
+The script stores one result per subscriber plus an aggregate. The host-wide CPU monitor records
 one sample per interval in `cpu-samples.jsonl`, summarizes the samples in `cpu.json`, and records
 `cpu-abort.json` if the limit is exceeded. It terminates only the processes started by the current
 run after the configured number of consecutive samples over the limit. `cpu.json` contains the
 sample count and host CPU `min`, `p50`, `p95`, `max`, and `average` percentages. The same interval
 also records CPU usage for each started process in `process-cpu-samples.jsonl` and summarizes it in
-`process-cpu.json`: Core NATS, each Leaf NATS, the Publisher, and each Subscriber are identified by
-`label` and `category`. `cpu_percent_host` is normalized to the whole host capacity (the same
+`process-cpu.json`: the Core NATS and Publisher on the PUB host, and each Leaf NATS, each
+sub-side NATS, and each Subscriber on the SUB host, are identified by `label` and `category`
+(`nats` or `application`), so the per-tier CPU cost can be read off directly. `cpu_percent_host` is normalized to the whole host capacity (the same
 0--100 percent scale as `cpu.json`), while `cpu_percent_single_core` is normalized to one CPU core.
 The same measurement interval also records `system-samples.jsonl` and `io.json` for aggregate
 `iowait`, `tcp-queue-samples.jsonl` for `ss` socket states and `Recv-Q`/`Send-Q`,
 `netdev-samples.jsonl` for `/proc/net/dev` RX/TX counters and per-interval deltas, and `network.json`
 for total deltas, peak bytes/s and packets/s, and peak drop/error deltas per interface.
 `tcp-queue.json` summarizes the maximum `Recv-Q`/`Send-Q` and socket states from
-`tcp-queue-samples.jsonl`. `nats-samples.jsonl` stores the Core/Leaf `/varz` and
-`/connz?subs=1` snapshots, while `nats-queue.json` summarizes maximum pending bytes/messages and
-traffic counters per server. These files are diagnostic evidence; the benchmark result remains the
+`tcp-queue-samples.jsonl`. `nats-samples.jsonl` stores `/varz` and `/connz` snapshots —
+each host samples only the servers it runs, so the PUB host records the Core and the SUB
+host records every Leaf and sub-side server — while `nats-queue.json` summarizes maximum
+pending bytes/messages and traffic counters per server. These snapshots deliberately omit
+`?subs=1`: nothing downstream reads the subscription list, and on the SUB host it would
+mean fetching one entry per subscriber per server per interval. Only the readiness gate
+asks for `?subs=1`, and only until publishing starts. These files are diagnostic evidence; the benchmark result remains the
 latency and delivery result in `result.json`.
 
 ```bash
-# SUB host (start first; use the PUB host address)
+# SUB host (start first; it runs the Leaf and sub-side tiers, then the subscribers)
 ./scripts/bench-leaf-2host-native.sh --role sub --mode leaf --pub-host <pub-host-ip> \
-  --leaf-count 5 --subscriber-count 100 --rate 1000 --duration-sec 30 --size 500 \
-  --clock realtime --label leaf5-100sub
+  --leaf-count 5 --sub-server-count 10 --subscriber-count 100 \
+  --rate 1000 --duration-sec 30 --size 500 --clock realtime --label leaf5-sub10-100sub
 
-# PUB host (start after the SUB command is waiting)
-./scripts/bench-leaf-2host-native.sh --role pub --mode leaf --pub-host <pub-host-ip> \
-  --leaf-count 5 --subscriber-count 100 --rate 1000 --duration-sec 30 --size 500 \
-  --clock realtime --label leaf5-100sub
+# PUB host (start after the SUB command is waiting; --sub-host is required in leaf mode)
+./scripts/bench-leaf-2host-native.sh --role pub --mode leaf \
+  --pub-host <pub-host-ip> --sub-host <sub-host-ip> \
+  --leaf-count 5 --sub-server-count 10 --subscriber-count 100 \
+  --rate 1000 --duration-sec 30 --size 500 --clock realtime --label leaf5-sub10-100sub
 ```
 
-Use `--mode direct --leaf-count 0` for the baseline. For convenience, `--mode leaf --leaf-count 0`
-is treated identically as Direct mode. The default CPU limit is 80 percent,
+Pass the same `--leaf-count`, `--sub-server-count`, and `--subscriber-count` to both roles —
+they derive the port map and the readiness target from those numbers independently.
+Use `--sub-server-count 0` to compare against a two-tier Core→Leaf→Subscriber run, and
+`--mode direct --leaf-count 0` for the baseline. For convenience, `--mode leaf --leaf-count 0`
+is treated identically as Direct mode, and `direct` forces `--sub-server-count 0`.
+The default CPU limit is 80 percent,
 sampled once per second for three consecutive samples; override it with `--cpu-limit`,
-`--cpu-interval-sec`, and `--cpu-consecutive`. The script checks all local NATS ports before
-starting; if a previous run or another service is using one, stop it or pass the same
+`--cpu-interval-sec`, and `--cpu-consecutive`. Each role checks the ports it will bind on
+its own host before starting — the PUB host the Core ports, the SUB host the Leaf and
+sub-side ports. If a previous run or another service is using one, stop it or pass the same
 `--port-offset N` to both host commands. This adds `N` to every benchmark port and allows
 separate runs to use different port ranges. Keep `--subject` unique for concurrent runs.
+
+Port map, before `--port-offset` is added (`i` = leaf index, `j` = sub-side server index):
+
+| Host | Server | Client | Monitor | Leafnodes |
+| --- | --- | --- | --- | --- |
+| PUB | `core` | 4222 | 8222 | 7422 (accepts the Leaf tier) |
+| SUB | `leaf-i` | 5000+i | 8200+i | 7600+i (accepts the sub-side tier) |
+| SUB | `subserver-j` | 5200+j | 8400+j | — (dials only) |
+
+The PUB host must be reachable on 7422 from the SUB host, and the SUB host's monitor ports
+must be reachable from the PUB host for the readiness gate.
+
+### 1回の実行を1行にまとめる
+
+Each role writes its own result directory, so one run with 100 subscribers spreads its
+numbers over roughly 460 files. `summarize-leaf-run.sh` reads both halves and writes one
+`summary.json` plus one row in `results/crosshost/leaf-summary.csv`:
+
+```bash
+# 両ホストが同じ results ツリー（共有NAS等）に書いている場合、ラベルでペアリングする
+./scripts/summarize-leaf-run.sh --label leaf5-sub10-100sub
+
+# ディレクトリを直接指定してもよい
+./scripts/summarize-leaf-run.sh --pub-dir results/crosshost/…-pub --sub-dir results/crosshost/…-sub
+```
+
+The run directory name ends in `-pub` or `-sub`, so both hosts can share one results tree
+without colliding when they start in the same second, and the two halves pair by name. The
+summarizer refuses to pair directories whose `meta.json` describe different runs.
+
+指標の取り方で2点、意図的な選択があります。
+
+- **CPUは層ごとに2通りで集計する。** `per_server_single_core_percent` は層内の全プロセス×全
+  インターバルのサンプルをプールした p50/p90/p99/max で、「その層のサーバー1台がどれだけ働いたか」。
+  Leafが5台しかない状態で台数方向に p99 を取ると max と同じ値にしかならないため、時間方向を
+  含めてプールしている。`tier_total_host_percent` は各インターバルで層内を合計してから分位点を
+  取った値で、「その層全体がホストの何%を使ったか」。台数を変えて比較するときはこちらが効く。
+- **レイテンシは既定では近似。** 各subscriberの分位点を集めて、その中央値（全体が遅いか）と
+  最大値（1台だけ遅いか）を出す。厳密な全体分位点が必要なら `--pool-latency` を付けると
+  `subscriber-*/latency.csv` を全件プールして計算する（rate × duration × subscriber 行を読む）。
+
+`summary.json` は識別情報・有効性（実効レート、CPU打ち切り、サンプル数、NICのdrop/error有無）・
+配信（欠損と欠損率）・レイテンシ・層別CPU・ホストCPU・NIC（回線速度に対する利用率）・
+NATSの送信詰まり・TCPキュー・io wait を持つ。`--no-csv` でCSV追記を止められる。
 
 `--clock realtime`がデフォルトです。片道レイテンシを正しく比較するには、両ホストの
 `CLOCK_REALTIME`をPTP等で同期してください。時計同期を使わない同一ホスト相当の確認では

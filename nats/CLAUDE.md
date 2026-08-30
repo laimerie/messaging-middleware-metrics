@@ -28,6 +28,51 @@ overall structure); everything in this file is scoped to `nats/` only. See `READ
 - **`jq` is a hard prerequisite** for all JSON handling (`meta.json`/`result.json`
   construction, `scenarios.json` parsing) — chosen over hand-built JSON strings for
   correctness/escaping safety. Any real Linux target installs it via `apt`/`yum`.
+- **Leaf ノードは SUB ホストに置く。PUB ホストに置いても fan-out の負荷は減らない。**
+  `bench-leaf-2host-native.sh --mode leaf` は当初 Leaf を全て PUB ホスト上に立てていたが、
+  この配置では Subscriber 100 個分の TCP 接続がそのまま PUB ホストの NIC を通るため、
+  ホスト間を渡るコピー数は Direct 構成と変わらない（Leaf を挟んでも N のまま）。実測は
+  NIC 飽和側に律速され、Core/Leaf の比較になっていなかった。Leaf を SUB ホストへ移すと
+  ホスト間の接続数が N（Subscriber数）から L（Leaf数）に落ちる。**これが Leaf 階層化の
+  唯一の目的なので、Leaf を PUB ホスト側へ戻す変更をしてはいけない。**
+  Leaf の下にもう一段 `--sub-server-count S` を積める:
+  `core(PUB) → leaf×L(SUB) → subserver×S(SUB) → subscriber×N(SUB)`。`S=0` で Leaf 直結
+  （2段）。段の割り当ては全て round-robin（`subserver j → leaf j mod L`、
+  `subscriber i → subserver i mod S`）。
+- **Leaf を SUB 側に置いた結果、`--role pub --mode leaf` では `--sub-host` が必須。**
+  NATS の購読 interest は leaf hop を越えるとき重複排除されるので、Core の `/connz` や
+  `/leafz` から Subscriber 数を数えることは**できない**（Leaf 1本につき 1 件に集約される）。
+  PUB 側は SUB ホストの監視ポートを直接引いて購読数を数え、併せて Core が受理した leaf
+  接続数が L に達したことを確認してから publish を開始する。`/leafz` の接続本数は
+  `.leafnodes` フィールド。
+- **監視サンプラーを PID ごとのプロセス起動で書かない。** サンプラーは測定対象ホスト自身の
+  上で動くので、その fork コストがそのまま被測定レイテンシのノイズになる。Subscriber 100 個
+  ＋ Leaf/sub側サーバーの構成では、PID ごとに `awk`/`jq`/`date`/`nproc` を起動する実装が
+  1 インターバルあたり数百プロセスに達し、ループ 1 周が `--cpu-interval-sec` を超えて
+  `process-cpu.json` が空になった（＝CPU 証跡が丸ごと取れない）。`/proc/<pid>/stat` は
+  awk 1 回で全 PID を舐め、JSON 化は `jq -R` に TSV を流し込む 1 回にまとめる。
+  同様に NATS の `/varz`・`/connz` はサーバー台数分を並列取得し、1 サーバー 1 ファイルに
+  書いてから連結する（同一ファイルへの並列追記は行を壊す）。定期サンプルに `?subs=1` を
+  付けない — 下流は pending/traffic カウンタしか読んでおらず、SUB ホストでは購読 1 件ずつの
+  巨大な配列を毎秒引くことになる。
+- **両ホストの結果ディレクトリ名にはロール接尾辞（`-pub` / `-sub`）を必ず残す。**
+  実測環境では両ホストが共有NAS上の同じ `results/` ツリーへ書く。`new_run_dir` は
+  `<timestamp>_<label>` を作るだけなので、両ロールに同じ `--label` を渡していて起動秒が
+  一致すると**同一ディレクトリに相乗りして `meta.json` と `result.json` を互いに上書きする**。
+  接尾辞は衝突回避と、`summarize-leaf-run.sh` のペアリングキーを兼ねている。
+- **層ごとのCPUは「1台あたり」と「層合計」の2通りを出す。** 台数方向だけで分位点を取ると、
+  Leaf 5台なら p90/p99 が max と同値になり情報がない。`per_server_single_core_percent` は
+  層内の全プロセス×全インターバルをプールした分位点（1台がどれだけ働いたか）、
+  `tier_total_host_percent` は各インターバルで層内を合計してからの分位点（層全体がホストの
+  何%を使ったか）。台数を変える比較では後者が効く。**`subserver j → leaf j mod L` のため
+  下流数は均等とは限らない**（L=3, S=5 なら 2/2/1）ので max を捨てないこと。
+- **`network.json` の bytes/s だけでは飽和判定ができない。** 回線容量が分からないため、
+  `meta.json` に `nic_speed_mbps`（`/sys/class/net/<if>/speed`、仮想・down は -1）を記録し、
+  サマリ側で利用率%に換算している。物理NICとloopbackは分けて見る — SUBホストでは段内fan-outが
+  全てloopbackを通るので、`lo` を混ぜるとホスト間トラフィックの評価を誤る。
+- **サマリのレイテンシは既定では「分位点の分位点」で近似値。** 各subscriberの p99 を集めて
+  中央値と最大を出している。厳密な全体分位点が要る場合は `--pool-latency`
+  （`subscriber-*/latency.csv` を全件プール）。実測で両者は数%ずれる。
 - See `TODO.md` for the active backlog and priority order of follow-up work.
 - All `bench-*.sh` scripts accept `--label` for consistency — `scripts/scenarios.json`-driven
   runs depend on this to name result folders after the scenario instead of each script's
